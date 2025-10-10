@@ -286,6 +286,8 @@ def rt_connect(auth=None):
         if h.lower().startswith('bearer '): tok = h.split(' ',1)[1].strip()
     if not tok:
         tok = request.args.get('token') or request.args.get('access_token')
+    if not tok:
+        tok = _extract_auth_token(request.environ)
     if API_TOKENS and not _is_tok_ok((tok or '').strip()):
         raise ConnectionRefusedError('unauthorized')
 
@@ -344,14 +346,33 @@ def _ws_send(ws, obj):
     try: ws.send(json.dumps(obj))
     except Exception: pass
 
-def _ws_auth_ok(env):
-    if not API_TOKENS: return True
+def _extract_auth_token(env: Dict[str, Any]) -> str:
     tok = (env.get('HTTP_AUTHORIZATION') or '').strip()
-    if tok.lower().startswith('bearer '): tok = tok.split(' ',1)[1].strip()
-    if not tok:
-        q = parse_qs(env.get('QUERY_STRING') or '')
-        tok = (q.get('token') or q.get('access_token') or [''])[0]
-    return _is_tok_ok(tok)
+    if tok.lower().startswith('bearer '):
+        tok = tok.split(' ', 1)[1].strip()
+    if tok:
+        return tok
+
+    q = parse_qs(env.get('QUERY_STRING') or '')
+    tok = (q.get('token') or q.get('access_token') or [''])[0]
+    if tok:
+        return tok
+
+    proto = env.get('HTTP_SEC_WEBSOCKET_PROTOCOL', '')
+    for part in proto.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        prefix = 'openai-insecure-api-key.'
+        if part.startswith(prefix):
+            return part[len(prefix):].strip()
+    return ''
+
+
+def _ws_auth_ok(env):
+    if not API_TOKENS:
+        return True
+    return _is_tok_ok(_extract_auth_token(env))
 
 def _transcribe_24k_pcm(pcm24: bytes) -> str:
     path = _pcm24k_to_webm_for_whisper(pcm24)
