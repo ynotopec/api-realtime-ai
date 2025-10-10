@@ -12,6 +12,28 @@ from flask_socketio import SocketIO, emit
 log = logging.getLogger(__name__).info
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s – %(message)s')
 
+
+def _summarize_payload(payload: Any, *, limit: int = 200) -> str:
+    """Return a compact string representation of payload objects for logging."""
+    try:
+        if payload is None:
+            return 'None'
+        if isinstance(payload, (str, bytes)):
+            if isinstance(payload, bytes):
+                payload = payload.decode('utf-8', errors='replace')
+            return payload if len(payload) <= limit else payload[:limit] + '…'
+        if isinstance(payload, (int, float, bool)):
+            return repr(payload)
+        if isinstance(payload, dict):
+            j = json.dumps(payload, default=str)
+            return j if len(j) <= limit else j[:limit] + '…'
+        if isinstance(payload, (list, tuple, set)):
+            j = json.dumps(list(payload), default=str)
+            return j if len(j) <= limit else j[:limit] + '…'
+        return repr(payload)[:limit] + ('…' if len(repr(payload)) > limit else '')
+    except Exception as exc:  # pragma: no cover - defensive logging helper
+        return f'<unserializable payload: {exc}>'
+
 class Cfg:
     AUDIO_API_KEY   = os.getenv('AUDIO_API_KEY')
     OPENAI_API_KEY  = os.getenv('OPENAI_API_KEY')
@@ -41,7 +63,16 @@ session.mount('https://', requests.adapters.HTTPAdapter(pool_connections=20, poo
 
 def post(url: str, **kw) -> requests.Response:
     kw.setdefault('timeout', Cfg.REQUEST_TIMEOUT)
-    r = session.post(url, **kw); r.raise_for_status(); return r
+    payload_preview = {}
+    for key in ('json', 'data'):
+        if key in kw and kw[key] is not None:
+            payload_preview[key] = _summarize_payload(kw[key])
+    if 'files' in kw:
+        payload_preview['files'] = list(kw['files'].keys())
+    log(f"[IO][HTTP][OUTBOUND] POST {url} opts={{'timeout': {kw.get('timeout')}}} payload={payload_preview}")
+    r = session.post(url, **kw)
+    log(f"[IO][HTTP][OUTBOUND][RESPONSE] url={url} status={r.status_code} length={len(r.content)}")
+    r.raise_for_status(); return r
 
 # ────────────────────────────── Helpers ──────────────────────────────
 FILTER = {s.lower() for s in ('thank you.',)}
@@ -133,6 +164,87 @@ def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
 # ────────────────────────────── Flask + Socket.IO ──────────────────────────────
 app = Flask(__name__); CORS(app)
 sio = SocketIO(app, cors_allowed_origins='*')
+
+
+@app.before_request
+def _log_request_in():
+    info = {
+        'method': request.method,
+        'path': request.path,
+        'remote_addr': request.remote_addr,
+        'args': request.args.to_dict(flat=False),
+        'content_type': request.content_type,
+    }
+    if request.files:
+        info['files'] = {
+            name: {'filename': f.filename, 'size': getattr(f, 'content_length', None)}
+            for name, f in request.files.items()
+        }
+    if request.is_json:
+        info['json'] = _summarize_payload(request.get_json(silent=True))
+    elif request.form:
+        info['form'] = {k: request.form.getlist(k) for k in request.form.keys()}
+    else:
+        data = request.get_data(cache=True)
+        if data:
+            info['data'] = _summarize_payload(data)
+    log(f"[IO][HTTP][REQUEST] {info}")
+
+
+@app.after_request
+def _log_response_out(response):
+    try:
+        body = response.get_data()
+        preview = '<binary>'
+        if body:
+            if response.mimetype and 'json' in (response.mimetype or ''):
+                try:
+                    preview = _summarize_payload(json.loads(body.decode('utf-8', errors='replace')))
+                except Exception:
+                    preview = _summarize_payload(body)
+            else:
+                preview = _summarize_payload(body)
+        log(
+            f"[IO][HTTP][RESPONSE] status={response.status_code} path={request.path} "
+            f"content_type={response.mimetype} length={len(body)} body={preview}"
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log(f"[IO][HTTP][RESPONSE][ERROR] {exc}")
+    return response
+
+
+_socketio_emit_original = sio.emit
+
+
+def _log_socketio_emit(event, data=None, *args, **kwargs):
+    namespace = kwargs.get('namespace')
+    if namespace is None and len(args) >= 1:
+        namespace = args[0]
+    target = kwargs.get('to') or kwargs.get('room') or kwargs.get('sid')
+    log(
+        f"[IO][SOCKETIO][EMIT] event={event} namespace={namespace or '/'} "
+        f"target={target} payload={_summarize_payload(data)}"
+    )
+    return _socketio_emit_original(event, data, *args, **kwargs)
+
+
+sio.emit = _log_socketio_emit
+
+
+_flask_emit_original = emit
+
+
+def _log_flask_emit(event, data=None, *args, **kwargs):
+    namespace = args[0] if args else kwargs.get('namespace')
+    target = kwargs.get('to') or kwargs.get('room') or kwargs.get('sid')
+    log(
+        f"[IO][SOCKETIO][FLASK_EMIT] event={event} namespace={namespace or '/'} "
+        f"target={target} payload={_summarize_payload(data)}"
+    )
+    return _flask_emit_original(event, data, *args, **kwargs)
+
+
+emit = _log_flask_emit
 
 try:
     from flask_sock import Sock
@@ -353,8 +465,11 @@ class WSConv:
         n=len(self.items); self.items=[x for x in self.items if x.get('id')!=i]; return len(self.items)!=n
 
 def _ws_send(ws, obj):
-    try: ws.send(json.dumps(obj))
-    except Exception: pass
+    try:
+        log(f"[IO][WS][SEND] {_summarize_payload(obj)}")
+        ws.send(json.dumps(obj))
+    except Exception as exc:
+        log(f"[IO][WS][SEND][ERROR] {exc}")
 
 def _extract_auth_token(env: Dict[str, Any]) -> str:
     tok = (env.get('HTTP_AUTHORIZATION') or '').strip()
