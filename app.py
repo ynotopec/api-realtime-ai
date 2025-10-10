@@ -411,23 +411,38 @@ def _stream_pcm24(ws, pcm24: bytes, hop_ms: int=60):
 if HAS_WS:
     @sock.route('/v1/realtime')
     def realtime_ws(ws):
-        if not _ws_auth_ok(ws.environ): _ws_send(ws, {'type':'error','error':{'message':'unauthorized'}}); return
+        if not _ws_auth_ok(ws.environ):
+            log('[REALTIME][WS] unauthorized websocket attempt rejected')
+            _ws_send(ws, {'type':'error','error':{'message':'unauthorized'}})
+            return
+
+        log('[REALTIME][WS] connection accepted')
         st = WSConv(); _ws_send(ws, {'type':'session.created','session':{'id':_nid('sess'),'sr':REALTIME_SR}})
         while True:
             msg = ws.receive()
-            if msg is None: break
-            try: d = json.loads(msg)
-            except Exception: _ws_send(ws, {'type':'error','error':{'message':'invalid JSON'}}); continue
+            if msg is None:
+                log('[REALTIME][WS] client closed websocket')
+                break
+            try:
+                d = json.loads(msg)
+            except Exception:
+                log(f"[REALTIME][WS] invalid JSON payload: {msg!r}")
+                _ws_send(ws, {'type':'error','error':{'message':'invalid JSON'}}); continue
             t = d.get('type')
+            log(f"[REALTIME][WS] received type={t}")
             if t == 'session.update': st.session.update(d.get('session') or {}); _ws_send(ws, {'type':'session.updated','session': st.session}); continue
             if t == 'input_audio_buffer.append':
-                try: st.audio.extend(base64.b64decode(d.get('audio') or ''))
+                try:
+                    chunk = d.get('audio') or ''
+                    st.audio.extend(base64.b64decode(chunk))
+                    log(f"[REALTIME][WS] buffered audio chunk bytes={len(chunk) * 3 // 4 if chunk else 0}")
                 except Exception: _ws_send(ws, {'type':'error','error':{'message':'bad audio base64'}})
                 continue
             if t == 'input_audio_buffer.commit':
                 uid = _nid('item'); ph = {'id':uid,'type':'message','role':'user','content':[{'type':'input_audio','mime_type':'audio/pcm;rate=24000'}]}
                 st.add(ph); _ws_send(ws, {'type':'conversation.item.created','item': ph})
                 pcm = bytes(st.audio); st.audio.clear(); tr = _transcribe_24k_pcm(pcm) if pcm else ''
+                log(f"[REALTIME][WS] committed buffered audio bytes={len(pcm)} transcript_len={len(tr)}")
                 it = {'id':uid,'type':'message','role':'user','content':[{'type':'input_audio','transcript': tr}]}
                 st.items = [it if x['id']==uid else x for x in st.items]
                 _ws_send(ws, {'type':'conversation.item.retrieved','item': it}); continue
@@ -438,13 +453,17 @@ if HAS_WS:
                 last = next((x for x in reversed(st.items) if x.get('role')=='user'), {})
                 c = (last.get('content') or [{}])[0]; last_txt = c.get('transcript') or c.get('text') or ''
                 ans = _simple_llm_reply(last_txt)
+                log(f"[REALTIME][WS] generating response for transcript_len={len(last_txt)} reply_len={len(ans)}")
                 _ws_send(ws, {'type':'response.output_text.delta','delta': ans})
                 try:
                     pcm16 = call_tts_pcm16le(ans); pcm24 = _resample_pcm_ffmpeg(pcm16,16000,REALTIME_SR); _stream_pcm24(ws, pcm24)
+                    log(f"[REALTIME][WS] streamed tts bytes={len(pcm24)}")
                 except Exception as e:
+                    log(f"[REALTIME][WS][TTS ERROR] {e}")
                     _ws_send(ws, {'type':'error','error':{'message': f'tts failed: {e}'}})
                 st.add({'id': _nid('item'),'type':'message','role':'assistant','content':[{'type':'output_text','text': ans}]})
                 _ws_send(ws, {'type':'response.done','response': {'id': _nid('resp')}}); continue
+            log(f"[REALTIME][WS] unhandled type received: {t}")
             _ws_send(ws, {'type':'error','error':{'message': f'unhandled type: {t}'}})
 
 # ────────────────────────────── Entrypoint ──────────────────────────────
