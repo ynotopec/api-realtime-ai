@@ -202,6 +202,7 @@ class RTSess:
         if 'aggressiveness' in td: self._aggr = int(td['aggressiveness']); self._vad = webrtcvad.Vad(self._aggr)
         for k,attr in [('start_ms','_start'),('end_ms','_end'),('pad_ms','_pad'),('max_ms','_max')]:
             if k in td: setattr(self, attr, int(td[k]))
+        log(f"[REALTIME] session update server_vad={self.server_vad} voice={self.voice} vad_aggr={self._aggr}")
 
     def append_audio(self, b64: str):
         if not b64: return
@@ -223,18 +224,19 @@ class RTSess:
             dur = len(self._frames) - (self._start_idx or 0)
             if self._nv >= ed or dur >= mx:
                 end = min(len(self._frames), len(self._frames) - self._nv + pad)
-                self._commit(self._start_idx, end); self._trig = False; self._start_idx = None; self._v = self._nv = 0
+                self._commit(self._start_idx, end, reason='vad'); self._trig = False; self._start_idx = None; self._v = self._nv = 0
 
     def commit(self):
         if self._trig and self._start_idx is not None:
             end = max(self._start_idx + 1, len(self._frames) - _ms2fr(100))
-            self._commit(self._start_idx, end); self._trig = False; self._start_idx = None
+            self._commit(self._start_idx, end, reason='manual-flush'); self._trig = False; self._start_idx = None
         elif self._frames:
-            self._commit(0, min(len(self._frames), _ms2fr(2000)))
+            self._commit(0, min(len(self._frames), _ms2fr(2000)), reason='manual')
 
-    def _commit(self, i0: int, i1: int):
+    def _commit(self, i0: int, i1: int, *, reason: str='vad'):
         if i1 <= i0: return
         b = b''.join(f['b24'] for f in self._frames[i0:i1]); self._frames = self._frames[i1:]
+        log(f"[REALTIME] commit reason={reason} frames={i1-i0} bytes={len(b)}")
         sio.emit('message', {'type':'event','content':{'type':'turn.start'}}, namespace='/realtime', to=self.sid)
         # Whisper
         p = _pcm24k_to_webm_for_whisper(b)
@@ -255,7 +257,11 @@ class RTSess:
             try: os.unlink(p)
             except Exception: pass
         # transcripts
-        if text: sio.emit('message', {'type':'transcript_temp','content':text}, namespace='/realtime', to=self.sid)
+        if text:
+            log(f"[REALTIME] transcript len={len(text)} text={text!r}")
+            sio.emit('message', {'type':'transcript_temp','content':text}, namespace='/realtime', to=self.sid)
+        else:
+            log('[REALTIME] transcription empty or unavailable')
         sio.emit('message', {'type':'transcript_final','content':text}, namespace='/realtime', to=self.sid)
         # TTS
         if text:
@@ -300,8 +306,9 @@ def rt_disconnect():
 
 @sio.on('update_session', namespace='/realtime')
 def rt_update_session(data):
-    s = _RT.get(request.sid); 
+    s = _RT.get(request.sid);
     if not s: emit('message', {'type':'error','content':'No realtime session'}, namespace='/realtime'); return
+    log(f"[REALTIME] update_session payload={data}")
     s.session_update((data or {}).get('session', {}))
 
 @sio.on('system_prompt', namespace='/realtime')
@@ -319,7 +326,9 @@ def rt_audio(data):
     if not b64: emit('message', {'type':'error','content':'Missing audio'}, namespace='/realtime'); return
     try:
         s.append_audio(b64)
-        if (data or {}).get('commit'): s.commit()
+        if (data or {}).get('commit'):
+            log('[REALTIME] client requested commit flag on audio payload')
+            s.commit()
     except Exception as e:
         log(f'[REALTIME][AUDIO ERROR] {e}'); emit('message', {'type':'error','content':str(e)}, namespace='/realtime')
 
@@ -327,6 +336,7 @@ def rt_audio(data):
 def rt_commit():
     s = _RT.get(request.sid)
     if not s: emit('message', {'type':'error','content':'No realtime session'}, namespace='/realtime'); return
+    log('[REALTIME] manual commit requested via event')
     s.commit()
 
 # ────────────────────────────── WS bridge (/v1/realtime) ──────────────────────────────
@@ -401,23 +411,38 @@ def _stream_pcm24(ws, pcm24: bytes, hop_ms: int=60):
 if HAS_WS:
     @sock.route('/v1/realtime')
     def realtime_ws(ws):
-        if not _ws_auth_ok(ws.environ): _ws_send(ws, {'type':'error','error':{'message':'unauthorized'}}); return
+        if not _ws_auth_ok(ws.environ):
+            log('[REALTIME][WS] unauthorized websocket attempt rejected')
+            _ws_send(ws, {'type':'error','error':{'message':'unauthorized'}})
+            return
+
+        log('[REALTIME][WS] connection accepted')
         st = WSConv(); _ws_send(ws, {'type':'session.created','session':{'id':_nid('sess'),'sr':REALTIME_SR}})
         while True:
             msg = ws.receive()
-            if msg is None: break
-            try: d = json.loads(msg)
-            except Exception: _ws_send(ws, {'type':'error','error':{'message':'invalid JSON'}}); continue
+            if msg is None:
+                log('[REALTIME][WS] client closed websocket')
+                break
+            try:
+                d = json.loads(msg)
+            except Exception:
+                log(f"[REALTIME][WS] invalid JSON payload: {msg!r}")
+                _ws_send(ws, {'type':'error','error':{'message':'invalid JSON'}}); continue
             t = d.get('type')
+            log(f"[REALTIME][WS] received type={t}")
             if t == 'session.update': st.session.update(d.get('session') or {}); _ws_send(ws, {'type':'session.updated','session': st.session}); continue
             if t == 'input_audio_buffer.append':
-                try: st.audio.extend(base64.b64decode(d.get('audio') or ''))
+                try:
+                    chunk = d.get('audio') or ''
+                    st.audio.extend(base64.b64decode(chunk))
+                    log(f"[REALTIME][WS] buffered audio chunk bytes={len(chunk) * 3 // 4 if chunk else 0}")
                 except Exception: _ws_send(ws, {'type':'error','error':{'message':'bad audio base64'}})
                 continue
             if t == 'input_audio_buffer.commit':
                 uid = _nid('item'); ph = {'id':uid,'type':'message','role':'user','content':[{'type':'input_audio','mime_type':'audio/pcm;rate=24000'}]}
                 st.add(ph); _ws_send(ws, {'type':'conversation.item.created','item': ph})
                 pcm = bytes(st.audio); st.audio.clear(); tr = _transcribe_24k_pcm(pcm) if pcm else ''
+                log(f"[REALTIME][WS] committed buffered audio bytes={len(pcm)} transcript_len={len(tr)}")
                 it = {'id':uid,'type':'message','role':'user','content':[{'type':'input_audio','transcript': tr}]}
                 st.items = [it if x['id']==uid else x for x in st.items]
                 _ws_send(ws, {'type':'conversation.item.retrieved','item': it}); continue
@@ -428,13 +453,17 @@ if HAS_WS:
                 last = next((x for x in reversed(st.items) if x.get('role')=='user'), {})
                 c = (last.get('content') or [{}])[0]; last_txt = c.get('transcript') or c.get('text') or ''
                 ans = _simple_llm_reply(last_txt)
+                log(f"[REALTIME][WS] generating response for transcript_len={len(last_txt)} reply_len={len(ans)}")
                 _ws_send(ws, {'type':'response.output_text.delta','delta': ans})
                 try:
                     pcm16 = call_tts_pcm16le(ans); pcm24 = _resample_pcm_ffmpeg(pcm16,16000,REALTIME_SR); _stream_pcm24(ws, pcm24)
+                    log(f"[REALTIME][WS] streamed tts bytes={len(pcm24)}")
                 except Exception as e:
+                    log(f"[REALTIME][WS][TTS ERROR] {e}")
                     _ws_send(ws, {'type':'error','error':{'message': f'tts failed: {e}'}})
                 st.add({'id': _nid('item'),'type':'message','role':'assistant','content':[{'type':'output_text','text': ans}]})
                 _ws_send(ws, {'type':'response.done','response': {'id': _nid('resp')}}); continue
+            log(f"[REALTIME][WS] unhandled type received: {t}")
             _ws_send(ws, {'type':'error','error':{'message': f'unhandled type: {t}'}})
 
 # ────────────────────────────── Entrypoint ──────────────────────────────
