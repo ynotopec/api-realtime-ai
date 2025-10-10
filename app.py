@@ -202,6 +202,7 @@ class RTSess:
         if 'aggressiveness' in td: self._aggr = int(td['aggressiveness']); self._vad = webrtcvad.Vad(self._aggr)
         for k,attr in [('start_ms','_start'),('end_ms','_end'),('pad_ms','_pad'),('max_ms','_max')]:
             if k in td: setattr(self, attr, int(td[k]))
+        log(f"[REALTIME] session update server_vad={self.server_vad} voice={self.voice} vad_aggr={self._aggr}")
 
     def append_audio(self, b64: str):
         if not b64: return
@@ -223,18 +224,19 @@ class RTSess:
             dur = len(self._frames) - (self._start_idx or 0)
             if self._nv >= ed or dur >= mx:
                 end = min(len(self._frames), len(self._frames) - self._nv + pad)
-                self._commit(self._start_idx, end); self._trig = False; self._start_idx = None; self._v = self._nv = 0
+                self._commit(self._start_idx, end, reason='vad'); self._trig = False; self._start_idx = None; self._v = self._nv = 0
 
     def commit(self):
         if self._trig and self._start_idx is not None:
             end = max(self._start_idx + 1, len(self._frames) - _ms2fr(100))
-            self._commit(self._start_idx, end); self._trig = False; self._start_idx = None
+            self._commit(self._start_idx, end, reason='manual-flush'); self._trig = False; self._start_idx = None
         elif self._frames:
-            self._commit(0, min(len(self._frames), _ms2fr(2000)))
+            self._commit(0, min(len(self._frames), _ms2fr(2000)), reason='manual')
 
-    def _commit(self, i0: int, i1: int):
+    def _commit(self, i0: int, i1: int, *, reason: str='vad'):
         if i1 <= i0: return
         b = b''.join(f['b24'] for f in self._frames[i0:i1]); self._frames = self._frames[i1:]
+        log(f"[REALTIME] commit reason={reason} frames={i1-i0} bytes={len(b)}")
         sio.emit('message', {'type':'event','content':{'type':'turn.start'}}, namespace='/realtime', to=self.sid)
         # Whisper
         p = _pcm24k_to_webm_for_whisper(b)
@@ -255,7 +257,11 @@ class RTSess:
             try: os.unlink(p)
             except Exception: pass
         # transcripts
-        if text: sio.emit('message', {'type':'transcript_temp','content':text}, namespace='/realtime', to=self.sid)
+        if text:
+            log(f"[REALTIME] transcript len={len(text)} text={text!r}")
+            sio.emit('message', {'type':'transcript_temp','content':text}, namespace='/realtime', to=self.sid)
+        else:
+            log('[REALTIME] transcription empty or unavailable')
         sio.emit('message', {'type':'transcript_final','content':text}, namespace='/realtime', to=self.sid)
         # TTS
         if text:
@@ -300,8 +306,9 @@ def rt_disconnect():
 
 @sio.on('update_session', namespace='/realtime')
 def rt_update_session(data):
-    s = _RT.get(request.sid); 
+    s = _RT.get(request.sid);
     if not s: emit('message', {'type':'error','content':'No realtime session'}, namespace='/realtime'); return
+    log(f"[REALTIME] update_session payload={data}")
     s.session_update((data or {}).get('session', {}))
 
 @sio.on('system_prompt', namespace='/realtime')
@@ -319,7 +326,9 @@ def rt_audio(data):
     if not b64: emit('message', {'type':'error','content':'Missing audio'}, namespace='/realtime'); return
     try:
         s.append_audio(b64)
-        if (data or {}).get('commit'): s.commit()
+        if (data or {}).get('commit'):
+            log('[REALTIME] client requested commit flag on audio payload')
+            s.commit()
     except Exception as e:
         log(f'[REALTIME][AUDIO ERROR] {e}'); emit('message', {'type':'error','content':str(e)}, namespace='/realtime')
 
@@ -327,6 +336,7 @@ def rt_audio(data):
 def rt_commit():
     s = _RT.get(request.sid)
     if not s: emit('message', {'type':'error','content':'No realtime session'}, namespace='/realtime'); return
+    log('[REALTIME] manual commit requested via event')
     s.commit()
 
 # ────────────────────────────── WS bridge (/v1/realtime) ──────────────────────────────
