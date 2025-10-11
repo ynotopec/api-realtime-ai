@@ -359,13 +359,15 @@ def upload():
     except Exception as e:
         log(f'[WHISPER ERROR] {e}')
         text = ''
-    if not text or _norm(text) in FILTER:
+    detected = ''
+    if text:
+        try:
+            from langdetect import detect
+            detected = detect(text)
+        except Exception:
+            detected = ''
+    if not text or (_norm(text) in FILTER and detected in {'', 'en'}):
         return jsonify({'text': '', 'diarization': diar})
-    try:
-        from langdetect import detect
-        detected = detect(text)
-    except Exception:
-        detected = ''
     res = {'detected_lang': detected, 'transcription': text, 'diarization': diar}
     res.update(build_translations(text, detected, primary, target))
     return jsonify(res)
