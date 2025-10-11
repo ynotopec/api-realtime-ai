@@ -1,4 +1,3 @@
-cat /home/ailab/api-translate-rt/app.py
 # /home/ailab/api-translate-rt/app.py
 import base64
 import json
