@@ -176,16 +176,43 @@ def tiny_chunk(file_obj: Any) -> bool:
     return size is not None and size < 16_000
 
 
+def _rewind_stream(file_obj: Any) -> Any:
+    stream = getattr(file_obj, "stream", None) or file_obj
+    if hasattr(stream, "seek"):
+        stream.seek(0)
+    return stream
+
+
 def call_whisper(file) -> Dict[str, Any]:
-    # Canonical multipart: file in 'files', model in 'data'
-    data = {'model': 'whisper-1'}
-    files = {'file': (file.filename, file.stream, 'audio/webm')}
-    return post(
-        Cfg.WHISPER_URL,
-        headers={'Authorization': f'Bearer {Cfg.AUDIO_API_KEY}'},
-        data=data,
-        files=files
-    ).json()
+    """Send the uploaded audio blob to the Whisper transcription backend."""
+    stream = _rewind_stream(file)
+    filename = getattr(file, "filename", None) or "audio.webm"
+    mimetype = getattr(file, "mimetype", None) or "audio/webm"
+
+    files = {
+        "file": (filename, stream, mimetype),
+        "model": (None, "whisper-1"),
+    }
+    try:
+        return post(
+            Cfg.WHISPER_URL,
+            headers={"Authorization": f"Bearer {Cfg.AUDIO_API_KEY}"},
+            files=files,
+        ).json()
+    except requests.HTTPError as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status is not None and 400 <= status < 500:
+            log("[WHISPER FALLBACK] status=%s – retrying with legacy payload", status)
+            stream = _rewind_stream(file)
+            legacy_files = {"file": (filename, stream, mimetype)}
+            data = {"model": "whisper-1"}
+            return post(
+                Cfg.WHISPER_URL,
+                headers={"Authorization": f"Bearer {Cfg.AUDIO_API_KEY}"},
+                files=legacy_files,
+                data=data,
+            ).json()
+        raise
 
 
 def call_diarization(file, target_lang: str) -> Dict[str, Any]:
