@@ -1,16 +1,33 @@
 # /home/ailab/api-translate-rt/app.py
-import os, json, base64, tempfile, subprocess, uuid, re, logging, threading, time
+import base64
+import json
+import logging
+import os
+import re
+import subprocess
+import tempfile
+import uuid
+from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 from urllib.parse import parse_qs
-from typing import Dict, Any, List
-import requests, numpy as np, webrtcvad
-from flask import Flask, request, jsonify
+
+import numpy as np
+import requests
+import webrtcvad
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO  # utilisé pour l’entrypoint HTTP
 
 # ────────────────────────────── Config & logging ──────────────────────────────
-log = logging.getLogger(__name__).info
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s – %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def log(message: str, *args: Any, **kwargs: Any) -> None:
+    """Adapter retained for backward compatibility with existing log() calls."""
+
+    logger.info(message, *args, **kwargs)
 
 def _summarize_payload(payload: Any, *, limit: int = 200) -> str:
     try:
@@ -42,31 +59,74 @@ class Cfg:
     REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '30'))
     MAX_CACHE_SIZE  = int(os.getenv('MAX_CACHE_SIZE', '256'))
 
-for v in ('AUDIO_API_KEY', 'OPENAI_API_KEY'):
-    if not getattr(Cfg, v):
-        raise RuntimeError(f'Missing mandatory env variable : {v}')
+for var_name in ("AUDIO_API_KEY", "OPENAI_API_KEY"):
+    if not getattr(Cfg, var_name):
+        raise RuntimeError(f"Missing mandatory env variable : {var_name}")
 
 session = requests.Session()
-session.mount('http://', requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2))
-session.mount('https://', requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2))
+session.mount(
+    "http://",
+    requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2),
+)
+session.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2),
+)
 
-def post(url: str, **kw) -> requests.Response:
-    kw.setdefault('timeout', Cfg.REQUEST_TIMEOUT)
-    payload_preview = {}
-    for key in ('json', 'data'):
-        if key in kw and kw[key] is not None:
-            payload_preview[key] = _summarize_payload(kw[key])
-    if 'files' in kw:
-        payload_preview['files'] = list(kw['files'].keys())
-    log(f"[IO][HTTP][OUTBOUND] POST {url} opts={{'timeout': {kw.get('timeout')}}} payload={payload_preview}")
-    r = session.post(url, **kw)
-    log(f"[IO][HTTP][OUTBOUND][RESPONSE] url={url} status={r.status_code} length={len(r.content)}")
-    r.raise_for_status()
-    return r
+
+def _preview_payload(options: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Build a lightweight preview of an HTTP payload for safe logging."""
+
+    preview: Dict[str, Any] = {}
+
+    for key in ("json", "data"):
+        value = options.get(key)
+        if value is not None:
+            preview[key] = _summarize_payload(value)
+
+    files = options.get("files")
+    if isinstance(files, MutableMapping):
+        preview["files"] = list(files.keys())
+
+    return preview
+
+
+def post(url: str, **kwargs: Any) -> requests.Response:
+    """POST wrapper that centralises logging, timeouts and error handling."""
+
+    kwargs.setdefault("timeout", Cfg.REQUEST_TIMEOUT)
+    payload_preview = _preview_payload(kwargs)
+    log(
+        "[IO][HTTP][OUTBOUND] POST %s opts={'timeout': %s} payload=%s",
+        url,
+        kwargs.get("timeout"),
+        payload_preview,
+    )
+    response = session.post(url, **kwargs)
+    log(
+        "[IO][HTTP][OUTBOUND][RESPONSE] url=%s status=%s length=%s",
+        url,
+        response.status_code,
+        len(response.content),
+    )
+    response.raise_for_status()
+    return response
 
 # ────────────────────────────── Helpers ──────────────────────────────
-FILTER = {s.lower() for s in ('thank you.',)}
-LANG_NAME = {'fr':'French','en':'English','ro':'Romanian','bg':'Bulgarian','es':'Spanish','de':'German','it':'Italian','pt':'Brazilian Portuguese','ru':'Russian','zh-cn':'Simplified Chinese','zh-tw':'Traditional Chinese'}
+FILTER = {s.lower() for s in ("thank you.",)}
+LANG_NAME = {
+    "fr": "French",
+    "en": "English",
+    "ro": "Romanian",
+    "bg": "Bulgarian",
+    "es": "Spanish",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Brazilian Portuguese",
+    "ru": "Russian",
+    "zh-cn": "Simplified Chinese",
+    "zh-tw": "Traditional Chinese",
+}
 
 REALTIME_SR = 24000
 FRAME_MS = 20
@@ -75,12 +135,29 @@ SMP_24K = int(REALTIME_SR * FRAME_MS / 1000)
 BPC_24K = SMP_24K * BYTES_PER_SAMPLE
 SMP_16K = int(16000 * FRAME_MS / 1000)
 
-def tiny_chunk(file) -> bool:
-    if getattr(file, 'content_length', None):
-        return file.content_length < 16_000
-    p = file.stream.tell(); file.stream.seek(0, os.SEEK_END)
-    s = file.stream.tell(); file.stream.seek(p)
-    return s < 16_000
+def _stream_length(file_obj: Any) -> Optional[int]:
+    """Best effort attempt at retrieving the length of an uploaded stream."""
+
+    length = getattr(file_obj, "content_length", None)
+    if length is not None:
+        return int(length)
+
+    stream = getattr(file_obj, "stream", None)
+    if stream is None or not hasattr(stream, "tell") or not hasattr(stream, "seek"):
+        return None
+
+    position = stream.tell()
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    stream.seek(position)
+    return int(size)
+
+
+def tiny_chunk(file_obj: Any) -> bool:
+    """Return True when the upload is smaller than the Whisper minimum."""
+
+    size = _stream_length(file_obj)
+    return size is not None and size < 16_000
 
 def call_whisper(file) -> Dict[str, Any]:
     files = {'file': (file.filename, file.stream, 'audio/webm'), 'model': (None, 'whisper-1')}
@@ -218,23 +295,53 @@ except Exception:
     sock=None; HAS_WS=False
 
 def _nid(p='item'): return f"{p}_{uuid.uuid4().hex[:12]}"
-def _b64(b:bytes)->str: return base64.b64encode(b).decode()
+def _b64(b: bytes) -> str:
+    return base64.b64encode(b).decode()
 
+
+def _default_session_config() -> Dict[str, Any]:
+    return {
+        "voice": "shimmer",
+        "modalities": ["audio", "text"],
+        "input_audio_format": "pcm16",  # encodage int16 ; le rate est précisé via mime_type
+        "output_audio_format": "pcm16",
+        "turn_detection": {"type": "none"},
+        "input_audio_transcription": {"model": "gpt-4o-transcribe"},
+    }
+
+
+@dataclass
 class WSConv:
-    def __init__(self):
-        self.items: List[Dict[str, Any]] = []
-        self.audio=bytearray()
-        self.session={
-            "voice":"shimmer",
-            "modalities":["audio","text"],
-            "input_audio_format":"pcm16",     # encodage int16 ; le rate est précisé via mime_type
-            "output_audio_format":"pcm16",
-            "turn_detection":{"type":"none"},
-            "input_audio_transcription":{"model":"gpt-4o-transcribe"}
-        }
-    def add(self,it): self.items.append(it); return it
-    def get(self,i): return next((x for x in self.items if x.get('id')==i),None)
-    def delete(self,i): n=len(self.items); self.items=[x for x in self.items if x.get('id')!=i]; return len(self.items)!=n
+    items: List[Dict[str, Any]] = field(default_factory=list)
+    audio: bytearray = field(default_factory=bytearray)
+    session: Dict[str, Any] = field(default_factory=_default_session_config)
+
+    def add(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        self.items.append(item)
+        return item
+
+    def get(self, item_id: str) -> Optional[Dict[str, Any]]:
+        return next((x for x in self.items if x.get("id") == item_id), None)
+
+    def delete(self, item_id: str) -> bool:
+        initial_len = len(self.items)
+        self.items = [x for x in self.items if x.get("id") != item_id]
+        return len(self.items) != initial_len
+
+
+def _extract_text_from_parts(parts: Iterable[Dict[str, Any]]) -> str:
+    buffer: List[str] = []
+    for content in parts:
+        content_type = (content.get("type") or "").lower()
+        if content_type in {"input_text", "text", "output_text"}:
+            text = content.get("text")
+            if text:
+                buffer.append(str(text))
+        elif content_type == "input_audio":
+            transcript = content.get("transcript")
+            if transcript:
+                buffer.append(str(transcript))
+    return " ".join(segment.strip() for segment in buffer if segment and segment.strip())
 
 def _extract_auth_token(env:Dict[str,Any])->str:
     tok=(env.get('HTTP_AUTHORIZATION') or '').strip()
@@ -278,17 +385,7 @@ def _messages_from_items(st: WSConv) -> list:
         if (it.get('type') != 'message') or (it.get('role') not in ('system', 'user', 'assistant')):
             continue
 
-        parts = it.get('content') or []
-        buf = []
-        for c in parts:
-            t = (c.get('type') or '').lower()
-            if t in ('input_text', 'text', 'output_text'):
-                v = c.get('text', '')
-                if v: buf.append(v)
-            elif t == 'input_audio':
-                v = c.get('transcript', '')
-                if v: buf.append(v)
-        text = ' '.join(s.strip() for s in buf if s and s.strip())
+        text = _extract_text_from_parts(it.get('content') or [])
 
         # Pour les rares messages 'system' déjà présents dans st.items
         role = it.get('role')
