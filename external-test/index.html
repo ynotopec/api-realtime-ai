@@ -1,1 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Realtime Speech Translator (browser)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; }
+    #transcript { background:#111; color:#0f0; padding:12px; min-height:160px; white-space:pre-wrap; border-radius:8px; }
+    button { padding:8px 14px; margin-right:8px; border-radius:10px; border:1px solid #ccc; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <h1>Realtime Speech Translator</h1>
+  <p>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </p>
+  <p>Status: <span id="status">idle</span></p>
+  <pre id="transcript"></pre>
+
+<script>
+const WS_URL = "ws://localhost:8000/ws";
+const SAMPLE_RATE = 24000; // must match server/OpenAI
+
+let ws;
+let audioContext = null;
+let processor;
+let sourceNode;
+let isRecording = false;
+let isPlayingTTS = false;   // half-duplex flag
+let stream;
+let zeroGain;
+
+// small promise chain to serialize audio playback
+let audioQueue = Promise.resolve();
+
+// ---------- utils ----------
+function floatTo16BitPCM(float32Array) {
+  const l = float32Array.length;
+  const buffer = new Int16Array(l);
+  for (let i = 0; i < l; i++) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    buffer[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return buffer;
+}
+
+function resampleBuffer(buffer, inputSampleRate, targetSampleRate) {
+  if (inputSampleRate === targetSampleRate) return buffer;
+  const ratio = inputSampleRate / targetSampleRate;
+  const newLength = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  while (offsetResult < newLength) {
+    const nextOffsetBuffer = offsetResult * ratio;
+    const before = Math.floor(nextOffsetBuffer);
+    const after = Math.min(Math.ceil(nextOffsetBuffer), buffer.length - 1);
+    const atPoint = nextOffsetBuffer - before;
+    result[offsetResult] = (1 - atPoint) * buffer[before] + atPoint * buffer[after];
+    offsetResult++;
+  }
+  return result;
+}
+
+function int16ToBase64(int16Array) {
+  const bytes = new Uint8Array(int16Array.buffer);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function base64ToInt16(base64) {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return new Int16Array(bytes.buffer);
+}
+
+// ---------- core ----------
+async function startRecording() {
+  try {
+    // WebRTC constraints: AEC + NS + AGC + mono
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1
+        // sampleRate: SAMPLE_RATE, // non garanti par tous les navigateurs
+      }
+    });
+  } catch (err) {
+    alert("Microphone access denied: " + err);
+    return;
+  }
+
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const inputSampleRate = audioContext.sampleRate;
+
+  // Source micro
+  sourceNode = audioContext.createMediaStreamSource(stream);
+
+  // ScriptProcessor (simple et compatible)
+  const bufferSize = 2048;
+  processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+  sourceNode.connect(processor);
+
+  // Connecter à destination via zero-gain pour ne rien entendre mais garder le graph actif
+  zeroGain = audioContext.createGain();
+  zeroGain.gain.value = 0;
+  processor.connect(zeroGain);
+  zeroGain.connect(audioContext.destination);
+
+  // websocket
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    status.textContent = "connected";
+    // config initiale (ex: voix / langues)
+    ws.send(JSON.stringify({
+      type: "config",
+      voice: "ballad",
+      source_lang: "English",
+      target_lang: "French"
+    }));
+    status.textContent = "sending audio";
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      if (msg.type === "transcription.delta") {
+        transcriptEl.textContent += msg.text;
+      } else if (msg.type === "audio" && msg.audio) {
+        playInt16Base64Audio(msg.audio);
+      } else if (msg.type === "response.done") {
+        transcriptEl.textContent += "\n--- turn done ---\n";
+      } else if (msg.type === "event") {
+        console.log("event:", msg);
+      }
+    } catch (e) {
+      console.error("ws message parse error", e);
+    }
+  };
+
+  ws.onclose = () => { status.textContent = "ws closed"; };
+  ws.onerror = (e) => { console.error("ws error", e); status.textContent = "ws error"; };
+
+  // capture audio, resample -> int16 -> base64 -> send
+  processor.onaudioprocess = (evt) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (isPlayingTTS) return; // half-duplex: ne pas envoyer le micro quand le TTS joue
+
+    const channelData = evt.inputBuffer.getChannelData(0);
+    const float32 = (inputSampleRate === SAMPLE_RATE)
+      ? channelData
+      : resampleBuffer(channelData, inputSampleRate, SAMPLE_RATE);
+    const int16 = floatTo16BitPCM(float32);
+    const base64 = int16ToBase64(int16);
+    ws.send(JSON.stringify({ type: "input_audio", audio: base64 }));
+  };
+
+  isRecording = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  status.textContent = "recording";
+}
+
+function stopRecording() {
+  if (processor) {
+    processor.disconnect();
+    processor.onaudioprocess = null;
+  }
+  if (sourceNode) sourceNode.disconnect();
+  if (zeroGain) zeroGain.disconnect();
+  if (audioContext) audioContext.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+
+  isRecording = false;
+  isPlayingTTS = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  status.textContent = "stopped";
+}
+
+function playInt16Base64Audio(base64Data) {
+  if (!audioContext) return; // pas encore prêt
+  const int16 = base64ToInt16(base64Data);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+
+  const buffer = audioContext.createBuffer(1, float32.length, SAMPLE_RATE);
+  buffer.copyToChannel(float32, 0, 0);
+
+  const src = audioContext.createBufferSource();
+  src.buffer = buffer;
+  src.connect(audioContext.destination);
+
+  audioQueue = audioQueue.then(() => new Promise(resolve => {
+    isPlayingTTS = true;     // start ducking
+    src.onended = () => { isPlayingTTS = false; resolve(); };
+    // Safari/iOS: contexte suspendu tant qu’il n’y a pas d’interaction
+    if (audioContext.state === "suspended") {
+      audioContext.resume().then(() => src.start());
+    } else {
+      src.start();
+    }
+  }));
+}
+
+// UI wiring
+const startBtn = document.getElementById("startBtn");
+const stopBtn  = document.getElementById("stopBtn");
+const status   = document.getElementById("status");
+const transcriptEl = document.getElementById("transcript");
+
+startBtn.addEventListener("click", () => startRecording());
+stopBtn.addEventListener("click", () => stopRecording());
+</script>
+</body>
+</html>
 
