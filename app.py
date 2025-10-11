@@ -177,13 +177,18 @@ def tiny_chunk(file_obj: Any) -> bool:
 
 
 def call_whisper(file) -> Dict[str, Any]:
-    # Canonical multipart: file in 'files', model in 'data'
-    data = {'model': 'whisper-1'}
-    files = {'file': (file.filename, file.stream, 'audio/webm')}
+    """Send the uploaded audio blob to the Whisper transcription backend."""
+    # Some endpoints expect the "model" field to be part of the multipart form-data
+    # rather than the request body. Align with the historically working payload
+    # structure to maximise compatibility with both the legacy and current
+    # backends.
+    files = {
+        'file': (file.filename, file.stream, 'audio/webm'),
+        'model': (None, 'whisper-1'),
+    }
     return post(
         Cfg.WHISPER_URL,
         headers={'Authorization': f'Bearer {Cfg.AUDIO_API_KEY}'},
-        data=data,
         files=files
     ).json()
 
