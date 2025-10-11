@@ -135,6 +135,12 @@ SMP_24K = int(REALTIME_SR * FRAME_MS / 1000)
 BPC_24K = SMP_24K * BYTES_PER_SAMPLE
 SMP_16K = int(16000 * FRAME_MS / 1000)
 
+_RESAMPLE_RATIO_24_TO_16 = np.float32(SMP_24K / SMP_16K)
+_RESAMPLE_POS_24_TO_16 = np.arange(SMP_16K, dtype=np.float32) * _RESAMPLE_RATIO_24_TO_16
+_RESAMPLE_I0_24_TO_16 = _RESAMPLE_POS_24_TO_16.astype(np.int32)
+_RESAMPLE_I1_24_TO_16 = np.minimum(_RESAMPLE_I0_24_TO_16 + 1, SMP_24K - 1)
+_RESAMPLE_FRAC_24_TO_16 = _RESAMPLE_POS_24_TO_16 - _RESAMPLE_I0_24_TO_16
+
 def _stream_length(file_obj: Any) -> Optional[int]:
     """Best effort attempt at retrieving the length of an uploaded stream."""
 
@@ -216,18 +222,31 @@ def call_tts_pcm16le(text: str, voice: str, instructions: str) -> bytes:
         return fo.read()
 
 def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
-    x = np.frombuffer(b24, dtype=np.int16).astype(np.float32)
-    SMP_16 = int(16000 * FRAME_MS / 1000)
-    out = np.empty(SMP_16, dtype=np.float32)
-    step = 1.5
-    pos = 0.0
-    for i in range(SMP_16):
-        i0 = int(pos); frac = pos - i0
-        s0 = x[i0] if i0 < x.size else 0.0
-        s1 = x[i0+1] if (i0+1) < x.size else s0
-        out[i] = s0 + (s1 - s0) * frac
-        pos += step
-    return np.clip(out, -32768.0, 32767.0).astype(np.int16).tobytes()
+    if not b24:
+        return b""
+
+    src = np.frombuffer(b24, dtype=np.int16)
+    if not src.size:
+        return b""
+
+    src_f = src.astype(np.float32)
+
+    if src.size == SMP_24K:
+        base = src_f[_RESAMPLE_I0_24_TO_16]
+        diff = src_f[_RESAMPLE_I1_24_TO_16] - base
+        out = base + diff * _RESAMPLE_FRAC_24_TO_16
+    else:
+        # Generic path kept for unexpected frame sizes (e.g. partial buffers).
+        limit = max(src.size - 1, 0)
+        pos = np.linspace(0.0, limit, SMP_16K, dtype=np.float32)
+        i0 = np.floor(pos).astype(np.int32)
+        i1 = np.minimum(i0 + 1, limit)
+        frac = pos - i0
+        base = src_f[i0]
+        diff = src_f[i1] - base
+        out = base + diff * frac
+
+    return np.clip(out, -32768.0, 32767.0).astype(np.int16, copy=False).tobytes()
 
 def _resample_pcm_ffmpeg(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
     with tempfile.NamedTemporaryFile(suffix='.pcm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
