@@ -11,7 +11,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, MutableMapping, Optional
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Tuple
 from urllib.parse import parse_qs
 
 import numpy as np
@@ -177,11 +177,7 @@ def tiny_chunk(file_obj: Any) -> bool:
 
 
 def call_whisper(file) -> Dict[str, Any]:
-    """Send the uploaded audio blob to the Whisper transcription backend."""
-    # Some endpoints expect the "model" field to be part of the multipart form-data
-    # rather than the request body. Align with the historically working payload
-    # structure to maximise compatibility with both the legacy and current
-    # backends.
+    """Send the uploaded audio blob to the Whisper transcription backend (unchanged interface)."""
     files = {
         'file': (file.filename, file.stream, 'audio/webm'),
         'model': (None, 'whisper-1'),
@@ -347,19 +343,20 @@ except Exception:
 
 def openai_error(
     message: str,
-    error_type: str = 'internal_error',
+    error_type: str = 'invalid_request_error',
     param: Optional[str] = None,
     code: Optional[int] = None,
+    event_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Return an error payload that mimics OpenAI's Realtime schema."""
-
+    """Return an error payload that mimics OpenAI Realtime error schema."""
     return {
-        'type': 'response.error',
+        'type': 'error',
         'error': {
             'message': message,
             'type': error_type,
             'param': param,
             'code': code,
+            'event_id': event_id,
         },
     }
 
@@ -388,9 +385,13 @@ class WSConv:
     items: List[Dict[str, Any]] = field(default_factory=list)
     audio: bytearray = field(default_factory=bytearray)
     session: Dict[str, Any] = field(default_factory=_default_session_config)
+    last_user_item_id: Optional[str] = None
+    conv_id: str = field(default_factory=lambda: _nid('conv'))
 
     def add(self, item: Dict[str, Any]) -> Dict[str, Any]:
         self.items.append(item)
+        if item.get('type') == 'message' and item.get('role') == 'user':
+            self.last_user_item_id = item.get('id')
         return item
 
     def get(self, item_id: str) -> Optional[Dict[str, Any]]:
@@ -446,7 +447,6 @@ def _ws_auth_ok(env: MutableMapping[str, Any]) -> bool:
 
 def _session_payload(session_id: str, session_config: Dict[str, Any]) -> Dict[str, Any]:
     """Flatten the session identifier into the payload expected by clients."""
-
     return {'id': session_id, **session_config}
 
 
@@ -457,7 +457,6 @@ def _send_ws_json(
     lock: Optional[threading.Lock] = None,
 ) -> None:
     """Serialize and send JSON data over the websocket with consistent logging."""
-
     try:
         serialized = json.dumps(payload)
     except Exception as exc:
@@ -511,7 +510,6 @@ def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
         # Pour les rares messages 'system' déjà présents dans st.items
         role = it.get('role')
         if role == 'system' and not text and it.get('content'):
-            # garde au moins un system vide si besoin, sinon saute
             continue
         if text:
             msgs.append({'role': role, 'content': text})
@@ -541,7 +539,6 @@ if HAS_WS:
 
         def send(obj):
             """Thread-safe sender with logging + JSON safety."""
-
             _send_ws_json(ws, obj, lock=send_lock)
 
         if not _ws_auth_ok(ws.environ):
@@ -554,10 +551,12 @@ if HAS_WS:
         st.session.setdefault('sr', REALTIME_SR)
         st.session.setdefault('turn_detection', {'type': 'none'})
 
-        # Session ID aplati dans session.created / updated
+        # Session & Conversation boot
         sess_id = _nid('sess')
         session_payload = _session_payload(sess_id, st.session)
         send({'type': 'session.created', 'session': session_payload})
+        # Ajout spec: conversation.created
+        send({'type': 'conversation.created', 'conversation': {'id': st.conv_id}})
 
         current_resp = {'id': None, 'cancelled': False}
 
@@ -566,6 +565,7 @@ if HAS_WS:
             'aggr': int(os.getenv('DEFAULT_VAD_AGGR', '2')),
             'start_ms': 80, 'end_ms': 300, 'pad_ms': 120, 'max_ms': 10_000,
             '_frames': [], '_trig': False, '_start_idx': None, '_v': 0, '_nv': 0,
+            '_utter_start_ms': None,
             'auto_create_response': os.getenv('DEFAULT_VAD_AUTORESP', '1') == '1',
             'interrupt_response': False
         }
@@ -593,6 +593,9 @@ if HAS_WS:
             send({"type": "response.done", "response": {"id": rid, "output": [{"id": asst_item_id, "type": "message", "role": "assistant"}]}})
 
         # VAD processing
+        def _frame_count_to_ms(n_frames: int) -> int:
+            return n_frames * FRAME_MS
+
         def _process_vad_buffer():
             frames = vad_state['_frames']
             if not frames:
@@ -609,29 +612,35 @@ if HAS_WS:
                     vad_state['_trig'] = True
                     vad_state['_start_idx'] = max(0, len(frames) - vad_state['_v'] - pad_fr)
                     vad_state['_nv'] = 0
-                    send({"type": "input_audio_buffer.speech_started"})
+                    vad_state['_utter_start_ms'] = _frame_count_to_ms(vad_state['_start_idx'] or 0)
+                    send({"type": "input_audio_buffer.speech_started",
+                          "audio_start_ms": vad_state['_utter_start_ms']})
             else:
                 vad_state['_nv'] = 0 if f['v'] else vad_state['_nv'] + 1
                 dur = len(frames) - (vad_state['_start_idx'] or 0)
                 if vad_state['_nv'] >= end_fr or dur >= max_fr:
-                    # Robust end bound
                     end = min(
                         len(frames),
                         max((len(frames) - vad_state['_nv']) + pad_fr, (vad_state['_start_idx'] or 0) + 1)
                     )
-                    i0 = vad_state['_start_idx'] or 0
+                    i0 = (vad_state['_start_idx'] or 0)
                     i1 = end
                     if i1 <= i0:
                         vad_state['_trig'] = False
                         vad_state['_start_idx'] = None
                         vad_state['_v'] = vad_state['_nv'] = 0
+                        vad_state['_utter_start_ms'] = None
                         return
                     b = b''.join(fr['b24'] for fr in frames[i0:i1])
                     vad_state['_frames'] = frames[i1:]
                     vad_state['_trig'] = False
+                    audio_end_ms = _frame_count_to_ms(i1)
+                    send({"type": "input_audio_buffer.speech_stopped",
+                          "audio_start_ms": vad_state['_utter_start_ms'] or 0,
+                          "audio_end_ms": audio_end_ms})
                     vad_state['_start_idx'] = None
                     vad_state['_v'] = vad_state['_nv'] = 0
-                    send({"type": "input_audio_buffer.speech_stopped"})
+                    vad_state['_utter_start_ms'] = None
 
                     try:
                         uid = _nid('item')
@@ -643,16 +652,17 @@ if HAS_WS:
 
                         try:
                             tr = _transcribe_24k_pcm(b) if b else ''
+                            send({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr})
                         except Exception as e:
                             log(f"[REALTIME][WS][VAD][WHISPER] transcription error: {e}")
+                            send({"type": "conversation.item.input_audio_transcription.failed", "item_id": uid, "error": str(e)})
                             tr = ''
 
-                        send({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr})
-
-                        # stocker transcript côté serveur
-                        st.items = [({'id': uid, 'type': 'message', 'role': 'user',
-                                      'content': [{'type': 'input_audio', 'transcript': tr}]}
-                                     if x['id'] == uid else x) for x in st.items]
+                        # stocker transcript côté serveur (si présent)
+                        if tr:
+                            st.items = [({'id': uid, 'type': 'message', 'role': 'user',
+                                          'content': [{'type': 'input_audio', 'transcript': tr}]}
+                                         if x['id'] == uid else x) for x in st.items]
 
                         if vad_state.get('auto_create_response'):
                             _start_response_thread()
@@ -695,7 +705,7 @@ if HAS_WS:
             try:
                 ans = _llm_reply_from_history(st)
             except Exception as e:
-                send(openai_error(f'llm failed: {e}', 'internal_error', None, 500))
+                send(openai_error(f'LLM failed: {e}', 'internal_error', None, 500))
                 response_done(rid, asst_item_id)
                 return
 
@@ -723,7 +733,7 @@ if HAS_WS:
                 if not current_resp['cancelled']:
                     pcm16 = call_tts_pcm16le(ans, voice, tts_instructions)  # 16k mono
                     pcm24 = _resample_pcm_ffmpeg(pcm16, 16000, REALTIME_SR)  # upsample 24k
-                    hop = int(REALTIME_SR * 0.06) * 2  # ~60 ms in bytes (int16 mono)
+                    hop = int(REALTIME_SR * 0.06) * 2  # ~60 ms en bytes (int16 mono)
                     for i in range(0, len(pcm24), hop):
                         if current_resp['cancelled']:
                             send({'type': 'response.cancelled', 'response': {'id': rid}})
@@ -732,7 +742,7 @@ if HAS_WS:
                     if not current_resp['cancelled']:
                         response_audio_done(rid, asst_item_id)
             except Exception as e:
-                send(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
+                send(openai_error(f'TTS failed: {e}', 'internal_error', None, 500))
 
             response_done(rid, asst_item_id)
             st.add({'id': asst_item_id, 'type': 'message', 'role': 'assistant',
@@ -760,7 +770,11 @@ if HAS_WS:
 
             if t == 'session.update':
                 sess = d.get('session') or {}
-                for k in ('input_audio_format', 'output_audio_format', 'voice'):
+                # Voice immuable: ignorer et émettre un warning error si présent
+                if 'voice' in sess and sess['voice'] != st.session.get('voice'):
+                    send(openai_error("voice is immutable after session start", 'invalid_request_error', 'voice', 400))
+                    sess.pop('voice', None)
+                for k in ('input_audio_format', 'output_audio_format'):
                     if k in sess:
                         st.session[k] = sess[k]
                 if 'instructions' in sess:
@@ -780,9 +794,9 @@ if HAS_WS:
                             vad_state['end_ms'] = int(td['silence_duration_ms'])
                         if 'prefix_padding_ms' in td:
                             vad_state['pad_ms'] = int(td['prefix_padding_ms'])
-                        for k in ('start_ms', 'end_ms', 'pad_ms', 'max_ms'):
-                            if k in td:
-                                vad_state[k] = int(td[k])
+                        for k2 in ('start_ms', 'end_ms', 'pad_ms', 'max_ms'):
+                            if k2 in td:
+                                vad_state[k2] = int(td[k2])
                         if 'create_response' in td:
                             vad_state['auto_create_response'] = bool(td['create_response'])
                         if 'interrupt_response' in td:
@@ -804,19 +818,21 @@ if HAS_WS:
                     _on_append_feed_vad(chunk)
                 else:
                     st.audio.extend(chunk)
-                # pas d’ACK selon la spec
-                continue
+                continue  # pas d’ACK selon la spec
 
             if t == 'input_audio_buffer.clear':
                 st.audio.clear()
+                # reset VAD buffer/state
                 vad_state['_frames'].clear()
                 vad_state['_trig'] = False
                 vad_state['_start_idx'] = None
                 vad_state['_v'] = vad_state['_nv'] = 0
+                vad_state['_utter_start_ms'] = None
                 send({'type': 'input_audio_buffer.cleared'})
                 continue
 
             if t == 'input_audio_buffer.commit':
+                previous_id = st.last_user_item_id
                 uid = _nid('item')
                 user_item = {'id': uid, 'type': 'message', 'role': 'user',
                              'content': [{'type': 'input_audio', 'mime_type': f'audio/pcm;rate={REALTIME_SR}'}]}
@@ -825,26 +841,31 @@ if HAS_WS:
                 send({'type': 'conversation.item.created', 'item': user_item})
 
                 pcm = bytes(st.audio)
+                # reset buffers
                 st.audio.clear()
                 vad_state['_frames'].clear()
                 vad_state['_trig'] = False
                 vad_state['_start_idx'] = None
                 vad_state['_v'] = vad_state['_nv'] = 0
+                vad_state['_utter_start_ms'] = None
 
-                # ACK pratique (optionnel)
-                send({"type": "input_audio_buffer.committed"})
+                # ACK spec-like avec previous_item_id et item_id
+                send({"type": "input_audio_buffer.committed",
+                      "previous_item_id": previous_id, "item_id": uid})
 
                 try:
                     tr = _transcribe_24k_pcm(pcm) if pcm else ''
+                    send({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr})
                 except Exception as e:
                     log(f"[REALTIME][WS][WHISPER] transcription error: {e}")
+                    send({"type": "conversation.item.input_audio_transcription.failed", "item_id": uid, "error": str(e)})
                     tr = ''
 
-                send({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr})
                 # stocke transcript côté serveur
-                st.items = [({'id': uid, 'type': 'message', 'role': 'user',
-                              'content': [{'type': 'input_audio', 'transcript': tr}]}
-                             if x['id'] == uid else x) for x in st.items]
+                if tr:
+                    st.items = [({'id': uid, 'type': 'message', 'role': 'user',
+                                  'content': [{'type': 'input_audio', 'transcript': tr}]}
+                                 if x['id'] == uid else x) for x in st.items]
 
                 # Alignement OpenAI: auto réponse aussi après commit
                 td = st.session.get('turn_detection', {}) or {}
@@ -884,6 +905,13 @@ if HAS_WS:
             if t == 'conversation.item.delete':
                 ok = st.delete(d.get('item_id'))
                 send({'type': 'conversation.item.deleted', 'item_id': d.get('item_id'), 'deleted': ok})
+                continue
+
+            # Optional stub for truncate support
+            if t == 'conversation.item.truncate':
+                item_id = d.get('item_id')
+                # Here we don't actually truncate contents; we only ACK to satisfy clients expecting it.
+                send({'type': 'conversation.item.truncated', 'item_id': item_id})
                 continue
 
             if t == 'response.create':
