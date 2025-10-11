@@ -17,7 +17,7 @@ from urllib.parse import parse_qs
 import numpy as np
 import requests
 import webrtcvad
-from flask import Flask, jsonify, request
+from flask import Flask
 from flask_cors import CORS
 from flask_socketio import SocketIO  # utilisé pour l’entrypoint HTTP
 
@@ -332,45 +332,6 @@ def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
 app = Flask(__name__)
 CORS(app)
 sio = SocketIO(app, cors_allowed_origins='*')
-
-
-@app.route('/tts-proxy', methods=['POST'])
-def tts_proxy():
-    payload = request.get_json(force=True)
-    r = post(Cfg.TTS_URL, headers={'Authorization': f'Bearer {Cfg.TTS_API_KEY}', 'Content-Type': 'application/json'},
-             json=payload)
-    return r.content, r.status_code, {'Content-Type': r.headers.get('Content-Type', 'audio/webm')}
-
-
-@app.route('/upload', methods=['POST'])
-def upload():
-    f = request.files.get('file')
-    if not f:
-        return jsonify({'error': 'No file provided'}), 400
-    if tiny_chunk(f):
-        return jsonify({'text': ''})
-    target = request.form.get('target_lang', 'fr')
-    primary = request.form.get('primary_lang', 'fr')
-    diar = call_diarization(f, target)
-    f.stream.seek(0)
-    try:
-        w = call_whisper(f)
-        text = (w or {}).get('text', '').strip()
-    except Exception as e:
-        log(f'[WHISPER ERROR] {e}')
-        text = ''
-    detected = ''
-    if text:
-        try:
-            from langdetect import detect
-            detected = detect(text)
-        except Exception:
-            detected = ''
-    if not text or (_norm(text) in FILTER and detected in {'', 'en'}):
-        return jsonify({'text': '', 'diarization': diar})
-    res = {'detected_lang': detected, 'transcription': text, 'diarization': diar}
-    res.update(build_translations(text, detected, primary, target))
-    return jsonify(res)
 
 
 # ────────────────────────────── WS bridge (/v1/realtime) ──────────────────────
