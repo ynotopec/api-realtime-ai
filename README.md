@@ -1,9 +1,7 @@
 # Realtime Speech Bridge (Flask + Socket.IO)
 
-A lightweight Flask service that bridges **browser audio → ASR (Whisper)** → optional **diarization** → **LLM translation** → **TTS** with both **HTTP** and **Realtime** interfaces.
+A lightweight Flask service that bridges **browser audio → ASR (Whisper)** → optional **diarization** → **LLM translation** → **TTS** through realtime interfaces.
 
-* **/upload**: file upload → Whisper transcription → optional diarization → on-the-fly translations.
-* **/tts-proxy**: secure proxy to an external TTS API.
 * **/realtime** (Socket.IO): low-latency streaming with VAD (server-side) → Whisper chunks → TTS stream back to client.
 * **/v1/realtime** (WebSocket): OpenAI-style Realtime API bridge compatible with simple event schema.
 
@@ -18,7 +16,6 @@ A lightweight Flask service that bridges **browser audio → ASR (Whisper)** →
 * [Prerequisites](#prerequisites)
 * [Quickstart](#quickstart)
 * [Configuration](#configuration)
-* [HTTP API](#http-api)
 * [Realtime — Socket.IO](#realtime--socketio)
 * [Realtime — WebSocket Bridge (/v1/realtime)](#realtime--websocket-bridge-v1realtime)
 * [Examples](#examples)
@@ -57,9 +54,8 @@ Browser mic (24k PCM)  ──► Socket.IO / WebSocket
 
 ## Features
 
-* **File uploads** (`/upload`) with automatic **Whisper** transcription and language detection, optional **diarization**.
+* **Realtime transcription pipeline** powered by Whisper with optional diarization.
 * **Translation cache** with `lru_cache` to reduce latency/cost.
-* **TTS proxy** (`/tts-proxy`) returning audio (WebM/Opus by default) or PCM16 helper internally.
 * **Realtime streaming** (`/realtime` namespace):
 
   * Server-side **VAD** parameters configurable via session update.
@@ -146,61 +142,6 @@ python app.py  # or: gunicorn -k eventlet -w 1 app:sio --bind 0.0.0.0:5001
 * **Input** realtime: base64 **PCM16** at **24 kHz** (frame size = 20 ms, 960 bytes).
 * Whisper upload: `audio/webm` (Opus) is produced internally from PCM using `ffmpeg`.
 * TTS: external API returns WebM/Opus; helper converts to **PCM16 16 kHz** where needed.
-
----
-
-## HTTP API
-
-### `POST /upload`
-
-Upload a single audio file for transcription (+ optional diarization + translations).
-
-**Form fields**
-
-* `file` (required): audio file (e.g. WebM/Opus). Tiny chunks (<16 KB) are ignored.
-* `target_lang` (optional, default `fr`)
-* `primary_lang` (optional, default `fr`)
-
-**Response**
-
-```json
-{
-  "detected_lang": "en",
-  "transcription": "Hello world",
-  "diarization": { /* optional backend JSON */ },
-  "translation_fr": "Bonjour le monde",
-  "translation_bg": "Здравей свят"
-}
-```
-
-**cURL**
-
-```bash
-curl -F file=@sample.webm \
-     -F target_lang=bg -F primary_lang=fr \
-     -H "Authorization: Bearer $AUDIO_API_KEY" \
-     http://localhost:5001/upload
-```
-
-### `POST /tts-proxy`
-
-Proxies a JSON payload directly to the configured TTS provider.
-
-**Request**
-
-```json
-{
-  "model": "gpt-4o-mini-tts",
-  "input": "Bonjour !",
-  "voice": "coral",
-  "response_format": "opus"
-}
-```
-
-**Response**
-
-* Content-Type: audio (e.g. `audio/webm`)
-* Body: binary audio
 
 ---
 
@@ -320,14 +261,13 @@ ws.on("message", (d) => console.log(JSON.parse(d.toString())));
 
 * Gate realtime endpoints with `API_TOKENS`.
 * Use HTTPS/secure proxies in production.
-* Validate and size-limit uploads (tiny chunks are ignored; add reverse-proxy limits as needed).
 * Never log API keys.
 
 ---
 
 ## Troubleshooting
 
-* **No audio output**: verify TTS credentials and that `/tts-proxy` returns audio Content-Type.
+* **No audio output**: verify TTS credentials and upstream service health.
 * **Whisper errors**: check `AUDIO_API_KEY`, `WHISPER_URL`, and upstream service health.
 * **`ffmpeg` not found**: install it and ensure it’s on `$PATH` inside your runtime.
 * **High latency**: tune VAD (`start_ms`, `end_ms`, `pad_ms`, `max_ms`) and reduce TTS chunk size.
