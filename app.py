@@ -4,14 +4,11 @@ import base64
 import json
 import logging
 import os
-import re
-import string
 import subprocess
 import tempfile
 import threading
 import uuid
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 
 import numpy as np
@@ -58,12 +55,9 @@ class Cfg:
     OPENAI_API_BASE = os.getenv('OPENAI_API_BASE', '')
     OPENAI_MODEL = os.getenv('OPENAI_API_MODEL', 'gpt-oss')
     WHISPER_URL = os.getenv('WHISPER_URL', 'https://api-audio2txt.cloud-pi-native.com/v1/audio/transcriptions')
-    DIAR_URL = os.getenv('DIAR_URL', 'https://api-diarization.cloud-pi-native.com/upload-audio/')
-    DIAR_TOKEN = os.getenv('DIARIZATION_TOKEN')
     TTS_API_KEY = os.getenv('TTS_API_KEY')
     TTS_URL = os.getenv('TTS_API_URL', 'https://api-txt2audio.cloud-pi-native.com/v1/audio/speech')
     REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '30'))
-    MAX_CACHE_SIZE = int(os.getenv('MAX_CACHE_SIZE', '256'))
 
 
 for var_name in ("AUDIO_API_KEY", "OPENAI_API_KEY"):
@@ -120,26 +114,6 @@ def post(url: str, **kwargs: Any) -> requests.Response:
 
 
 # ────────────────────────────── Helpers ──────────────────────────────
-def _norm(s: str) -> str:
-    s = (s or "").lower().strip()
-    return s.translate(str.maketrans('', '', string.punctuation))
-
-
-FILTER = {_norm(s) for s in ("thank you", "thanks", "merci", "ok merci")}
-LANG_NAME = {
-    "fr": "French",
-    "en": "English",
-    "ro": "Romanian",
-    "bg": "Bulgarian",
-    "es": "Spanish",
-    "de": "German",
-    "it": "Italian",
-    "pt": "Brazilian Portuguese",
-    "ru": "Russian",
-    "zh-cn": "Simplified Chinese",
-    "zh-tw": "Traditional Chinese",
-}
-
 REALTIME_SR = 24000
 FRAME_MS = 20
 BYTES_PER_SAMPLE = 2
@@ -152,27 +126,6 @@ _RESAMPLE_POS_24_TO_16 = np.arange(SMP_16K, dtype=np.float32) * _RESAMPLE_RATIO_
 _RESAMPLE_I0_24_TO_16 = _RESAMPLE_POS_24_TO_16.astype(np.int32)
 _RESAMPLE_I1_24_TO_16 = np.minimum(_RESAMPLE_I0_24_TO_16 + 1, SMP_24K - 1)
 _RESAMPLE_FRAC_24_TO_16 = _RESAMPLE_POS_24_TO_16 - _RESAMPLE_I0_24_TO_16
-
-
-def _stream_length(file_obj: Any) -> Optional[int]:
-    """Best effort attempt at retrieving the length of an uploaded stream."""
-    length = getattr(file_obj, "content_length", None)
-    if length is not None:
-        return int(length)
-    stream = getattr(file_obj, "stream", None)
-    if stream is None or not hasattr(stream, "tell") or not hasattr(stream, "seek"):
-        return None
-    position = stream.tell()
-    stream.seek(0, os.SEEK_END)
-    size = stream.tell()
-    stream.seek(position)
-    return int(size)
-
-
-def tiny_chunk(file_obj: Any) -> bool:
-    """Return True when the upload is smaller than the Whisper minimum."""
-    size = _stream_length(file_obj)
-    return size is not None and size < 16_000
 
 
 def call_whisper(file) -> Dict[str, Any]:
@@ -190,48 +143,6 @@ def call_whisper(file) -> Dict[str, Any]:
         headers={'Authorization': f'Bearer {Cfg.AUDIO_API_KEY}'},
         files=files
     ).json()
-
-
-def call_diarization(file, target_lang: str) -> Dict[str, Any]:
-    if not Cfg.DIAR_TOKEN:
-        return {}
-    file.stream.seek(0)
-    files = {'file': (file.filename, file.stream, 'audio/webm'), 'target_lang': (None, target_lang)}
-    try:
-        return post(Cfg.DIAR_URL, headers={'Authorization': f'Bearer {Cfg.DIAR_TOKEN}'}, files=files).json()
-    except Exception as e:
-        log(f'[DIARIZATION ERROR] {e}')
-        return {}
-
-
-@lru_cache(maxsize=Cfg.MAX_CACHE_SIZE)
-def translate_text(text: str, lang: str) -> str:
-    lang_prompt = LANG_NAME.get(lang, lang)
-    data = {
-        'model': Cfg.OPENAI_MODEL,
-        'messages': [
-            {'role': 'system', 'content': 'You are a professional translator. Translate accurately and naturally.'},
-            {'role': 'user', 'content': f'Translate the text into {lang_prompt}. Return ONLY the translation.\n\n{text}'}
-        ],
-        'temperature': 0
-    }
-    out = post(
-        f"{Cfg.OPENAI_API_BASE}/chat/completions",
-        headers={'Authorization': f'Bearer {Cfg.OPENAI_API_KEY}'},
-        json=data
-    ).json()['choices'][0]['message']['content']
-    return re.sub(r'\s+', ' ', out).strip()
-
-
-def build_translations(txt: str, detected: str, primary: str, target: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for lg in {primary, target} - {detected}:
-        try:
-            out[f'translation_{lg}'] = translate_text(txt, lg)
-        except Exception as e:
-            log(f'[TRANSLATION ERROR target={lg}] {e}')
-            out[f'translation_{lg}'] = txt
-    return out
 
 
 def call_tts_webm(text: str, voice: str, instructions: str) -> bytes:
