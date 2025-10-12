@@ -1,6 +1,6 @@
 # Realtime Speech Bridge (FastAPI + WebSockets)
 
-A lightweight FastAPI service that bridges **browser audio → ASR (Whisper)** → optional **diarization** → **LLM translation** → **TTS** via a single OpenAI-style realtime WebSocket endpoint.
+A lightweight FastAPI service that bridges **browser audio → ASR (Whisper)** → **LLM replies** → **TTS** via a single OpenAI-style realtime WebSocket endpoint.
 
 * **`/v1/realtime` (WebSocket)**: accepts OpenAI Realtime-compatible events, handles optional server-side VAD, streams TTS audio back to the caller, and mirrors conversation state events.
 
@@ -35,11 +35,11 @@ Browser mic (24k PCM)  ──► FastAPI WebSocket (/v1/realtime)
          │                    ▼
          │               Whisper API (HTTP)
          │                    │
-         │         + optional diarization API
-         │                    │
          │                    ▼
          │              Transcription text
-         │               + translations
+         │                    │
+         │                    ▼
+         │         LLM chat completions (HTTP)
          │                    │
          │                    ▼
          │                 TTS API
@@ -52,8 +52,7 @@ Browser mic (24k PCM)  ──► FastAPI WebSocket (/v1/realtime)
 
 ## Features
 
-* **Realtime transcription pipeline** powered by Whisper with optional diarization.
-* **Translation cache** with `lru_cache` to reduce latency/cost.
+* **Realtime transcription pipeline** powered by Whisper.
 * **OpenAI-like realtime bridge** (`/v1/realtime`):
   * Accepts `input_audio_buffer.append` events with base64 PCM24k frames.
   * Optional **server-side VAD** (configurable via `session.update`).
@@ -90,12 +89,11 @@ Create a `.env` file or export the environment variables described in [Configura
 
 ```bash
 export AUDIO_API_KEY=...          # Whisper backend
-export OPENAI_API_KEY=...         # LLM for translations and simple replies
+export OPENAI_API_KEY=...         # LLM for conversation replies
 export OPENAI_API_BASE=https://your-openai-compatible-host
 export OPENAI_API_MODEL=gpt-oss
 export TTS_API_KEY=...
 export TTS_API_URL=https://api-txt2audio.cloud-pi-native.com/v1/audio/speech
-export DIARIZATION_TOKEN=...      # optional
 export API_TOKENS="token1,token2" # optional auth for realtime WebSocket
 export SERVER_NAME=0.0.0.0        # optional host binding
 export SERVER_PORT=8080           # optional port binding
@@ -117,16 +115,13 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 | Variable            | Required                 | Default                                                             | Description                                                                    |
 | ------------------- | ------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `AUDIO_API_KEY`     | ✅                        | –                                                                   | API key for Whisper transcription backend.                                     |
-| `OPENAI_API_KEY`    | ✅                        | –                                                                   | API key for OpenAI-compatible chat endpoint (translations, simple replies).    |
+| `OPENAI_API_KEY`    | ✅                        | –                                                                   | API key for OpenAI-compatible chat endpoint (conversation replies).            |
 | `OPENAI_API_BASE`   | ✅ (if not default)       | ``                                                                  | Base URL for OpenAI-compatible API (must expose `/chat/completions`).          |
-| `OPENAI_API_MODEL`  | ❌                        | `gpt-oss`                                                           | Model name for translations / simple replies.                                  |
+| `OPENAI_API_MODEL`  | ❌                        | `gpt-oss`                                                           | Model name for conversation replies.                                           |
 | `WHISPER_URL`       | ❌                        | `https://api-audio2txt.cloud-pi-native.com/v1/audio/transcriptions` | Whisper transcription endpoint.                                                |
-| `DIAR_URL`          | ❌                        | `https://api-diarization.cloud-pi-native.com/upload-audio/`         | Diarization endpoint.                                                          |
-| `DIARIZATION_TOKEN` | ❌                        | –                                                                   | Bearer token for diarization API.                                              |
 | `TTS_API_KEY`       | ❌ (required if TTS used) | –                                                                   | API key for TTS endpoint.                                                      |
 | `TTS_API_URL`       | ❌                        | `https://api-txt2audio.cloud-pi-native.com/v1/audio/speech`         | TTS endpoint.                                                                  |
 | `REQUEST_TIMEOUT`   | ❌                        | `30`                                                                | HTTP timeout (seconds) for upstream calls.                                     |
-| `MAX_CACHE_SIZE`    | ❌                        | `256`                                                               | LRU cache entries for translations.                                            |
 | `VAD_AGGR`          | ❌                        | `2`                                                                 | Default VAD aggressiveness (0..3).                                             |
 | `API_TOKENS`        | ❌                        | –                                                                   | Comma-separated tokens to allow access to realtime endpoint. Empty = no auth.  |
 | `SERVER_NAME`       | ❌                        | `0.0.0.0`                                                           | Bind address for the FastAPI/uvicorn server.                                   |
