@@ -234,32 +234,88 @@ def build_translations(txt: str, detected: str, primary: str, target: str) -> Di
     return out
 
 
-def call_tts_webm(text: str, voice: str, instructions: str) -> bytes:
+# ▼▼▼ NEW STREAMING TTS FUNCTION ▼▼▼
+def stream_tts_pcm_24k(text: str, voice: str, instructions: str) -> Iterable[bytes]:
+    """
+    Calls the TTS API and streams the audio, converting it on-the-fly to 24kHz PCM.
+    This function is a generator, yielding chunks of raw PCM audio.
+    """
     payload = {
         'model': 'gpt-4o-mini-tts',
         'input': text,
         'voice': voice,
         'instructions': instructions,
-        'response_format': 'opus'
+        'response_format': 'opus'  # Opus is efficient for streaming
     }
-    return post(
-        Cfg.TTS_URL,
-        headers={'Authorization': f'Bearer {Cfg.TTS_API_KEY}', 'Content-Type': 'application/json'},
-        json=payload
-    ).content
+    
+    # ffmpeg command to read opus from stdin, and output 24kHz 16-bit mono PCM to stdout
+    command = [
+        'ffmpeg', '-y',
+        '-i', 'pipe:0',
+        '-ar', str(REALTIME_SR),
+        '-f', 's16le',
+        '-ac', '1',
+        '-acodec', 'pcm_s16le',
+        'pipe:1'
+    ]
+    
+    process = None
+    try:
+        # Use Popen to have access to stdin/stdout streams, redirecting stderr to null
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        
+        # Make the API call in streaming mode
+        with session.post(
+            Cfg.TTS_URL,
+            headers={'Authorization': f'Bearer {Cfg.TTS_API_KEY}', 'Content-Type': 'application/json'},
+            json=payload,
+            stream=True,
+            timeout=Cfg.REQUEST_TIMEOUT
+        ) as response:
+            log(
+                "[IO][HTTP][TTS][RESPONSE] url=%s status=%s",
+                Cfg.TTS_URL,
+                response.status_code
+            )
+            response.raise_for_status()
+            
+            # Read from API and write to ffmpeg's stdin in chunks
+            for chunk in response.iter_content(chunk_size=4096):
+                if chunk and process.stdin:
+                    try:
+                        process.stdin.write(chunk)
+                    except (BrokenPipeError, OSError):
+                        # ffmpeg might have closed its stdin if it has enough data
+                        log("[TTS STREAM] ffmpeg stdin pipe broken, likely closed.")
+                        break
+            
+            if process.stdin:
+                process.stdin.close() # Signal ffmpeg that we are done writing
 
+        # Read from ffmpeg's stdout and yield chunks
+        # Read chunks of ~60ms to send to the client
+        chunk_size = int(REALTIME_SR * 0.25) * BYTES_PER_SAMPLE
+        while True:
+            if process.stdout:
+                output_chunk = process.stdout.read(chunk_size)
+                if output_chunk:
+                    yield output_chunk
+                else:
+                    break # No more output
+            else:
+                break
+                
+        process.wait(timeout=5) # Wait for ffmpeg to finish
 
-def call_tts_pcm16le(text: str, voice: str, instructions: str) -> bytes:
-    webm = call_tts_webm(text, voice, instructions)
-    with tempfile.NamedTemporaryFile(suffix='.webm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
-        fi.write(webm)
-        fi.flush()
-        subprocess.check_output(
-            ['ffmpeg', '-y', '-i', fi.name, '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', fo.name],
-            stderr=subprocess.DEVNULL
-        )
-        fo.seek(0)
-        return fo.read()
+    except Exception as e:
+        log(f"[TTS STREAM ERROR] {e}")
+        raise
+    finally:
+        # Make sure process is terminated if something went wrong
+        if process and process.poll() is None:
+            log("[TTS STREAM] Terminating ffmpeg process.")
+            process.terminate()
+            process.wait()
 
 
 def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
@@ -286,19 +342,6 @@ def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
     return np.clip(out, -32768.0, 32767.0).astype(np.int16, copy=False).tobytes()
 
 
-def _resample_pcm_ffmpeg(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix='.pcm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
-        fi.write(pcm)
-        fi.flush()
-        subprocess.check_output(
-            ['ffmpeg', '-y', '-f', 's16le', '-ar', str(sr_in), '-ac', '1', '-i', fi.name,
-             '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', str(sr_out), '-ac', '1', fo.name],
-            stderr=subprocess.DEVNULL
-        )
-        fo.seek(0)
-        return fo.read()
-
-
 def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
     f_pcm = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
     f_webm = tempfile.NamedTemporaryFile(suffix='.webm', delete=False)
@@ -319,6 +362,7 @@ def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
     finally:
         try:
             f_pcm.close()
+            os.unlink(f_pcm.name)
         except Exception:
             pass
         try:
@@ -471,14 +515,20 @@ def _transcribe_24k_pcm(pcm24: bytes) -> str:
     path = _pcm24k_to_webm_for_whisper(pcm24)
     class DF:
         filename = 'audio.webm'
+        stream = None
+        content_length = 0
     df = DF()
-    df.stream = open(path, 'rb')
-    df.content_length = os.path.getsize(path)
     try:
+        df.stream = open(path, 'rb')
+        df.content_length = os.path.getsize(path)
         return (call_whisper(df) or {}).get('text', '').strip()
     finally:
-        df.stream.close()
-        os.unlink(path)
+        if df.stream:
+            df.stream.close()
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
 
 
 def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
@@ -582,7 +632,12 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         current_resp['id'] = rid
         current_resp['cancelled'] = False
 
-        try: ans = _llm_reply_from_history(st)
+        try:
+            ans = _llm_reply_from_history(st)
+            if not ans:
+                log("[LLM] LLM returned an empty response.")
+                response_done(rid, asst_item_id)
+                return
         except Exception as e:
             send_from_thread(openai_error(f'llm failed: {e}', 'internal_error', None, 500))
             response_done(rid, asst_item_id)
@@ -596,22 +651,33 @@ async def realtime_ws_endpoint(websocket: WebSocket):
             accum.append(piece)
             response_text_delta(rid, asst_item_id, piece)
 
-        if not current_resp['cancelled']: response_text_done(rid, asst_item_id, "".join(accum))
-        else: response_done(rid, asst_item_id); return
+        if not current_resp['cancelled']:
+            response_text_done(rid, asst_item_id, "".join(accum))
+        else:
+            response_done(rid, asst_item_id)
+            return
 
         voice = st.session.get('voice', 'shimmer')
         tts_instructions = st.session.get('instructions', 'Speak clearly and positively.')
+        
+        # ▼▼▼ MODIFIED TTS STREAMING SECTION ▼▼▼
         try:
             if not current_resp['cancelled']:
-                pcm16 = call_tts_pcm16le(ans, voice, tts_instructions)
-                pcm24 = _resample_pcm_ffmpeg(pcm16, 16000, REALTIME_SR)
-                hop = int(REALTIME_SR * 0.06) * 2
-                for i in range(0, len(pcm24), hop):
+                # Use the streaming generator to get audio chunks on-the-fly
+                for pcm24_chunk in stream_tts_pcm_24k(ans, voice, tts_instructions):
                     if current_resp['cancelled']:
-                        send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}}); break
-                    response_audio_delta(rid, asst_item_id, _b64(pcm24[i:i + hop]))
-                if not current_resp['cancelled']: response_audio_done(rid, asst_item_id)
-        except Exception as e: send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
+                        send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
+                        break
+                    if pcm24_chunk:
+                        response_audio_delta(rid, asst_item_id, _b64(pcm24_chunk))
+                
+                if not current_resp['cancelled']:
+                    response_audio_done(rid, asst_item_id)
+
+        except Exception as e:
+            log(f"[TTS ERROR in _handle_response_create] {e}", exc_info=True)
+            send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
+        # ▲▲▲ END OF MODIFIED SECTION ▲▲▲
 
         response_done(rid, asst_item_id)
         st.add({'id': asst_item_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': ans}]})
