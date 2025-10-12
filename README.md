@@ -1,11 +1,10 @@
-# Realtime Speech Bridge (Flask + Socket.IO)
+# Realtime Speech Bridge (FastAPI + WebSockets)
 
-A lightweight Flask service that bridges **browser audio → ASR (Whisper)** → optional **diarization** → **LLM translation** → **TTS** through realtime interfaces.
+A lightweight FastAPI service that bridges **browser audio → ASR (Whisper)** → optional **diarization** → **LLM translation** → **TTS** via a single OpenAI-style realtime WebSocket endpoint.
 
-* **/realtime** (Socket.IO): low-latency streaming with VAD (server-side) → Whisper chunks → TTS stream back to client.
-* **/v1/realtime** (WebSocket): OpenAI-style Realtime API bridge compatible with simple event schema.
+* **`/v1/realtime` (WebSocket)**: accepts OpenAI Realtime-compatible events, handles optional server-side VAD, streams TTS audio back to the caller, and mirrors conversation state events.
 
-> Uses `ffmpeg` for audio muxing/resampling, `webrtcvad` for server VAD, and a remote Whisper+TTS backend via HTTP.
+> Uses `ffmpeg` for audio muxing/resampling, `webrtcvad` for server VAD, and upstream Whisper/TTS/LLM services accessible over HTTP.
 
 ---
 
@@ -16,8 +15,7 @@ A lightweight Flask service that bridges **browser audio → ASR (Whisper)** →
 * [Prerequisites](#prerequisites)
 * [Quickstart](#quickstart)
 * [Configuration](#configuration)
-* [Realtime — Socket.IO](#realtime--socketio)
-* [Realtime — WebSocket Bridge (/v1/realtime)](#realtime--websocket-bridge-v1realtime)
+* [Realtime WebSocket Bridge (`/v1/realtime`)](#realtime-websocket-bridge-v1realtime)
 * [Examples](#examples)
 * [Deployment](#deployment)
 * [Security notes](#security-notes)
@@ -29,7 +27,7 @@ A lightweight Flask service that bridges **browser audio → ASR (Whisper)** →
 ## Architecture
 
 ```
-Browser mic (24k PCM)  ──► Socket.IO / WebSocket
+Browser mic (24k PCM)  ──► FastAPI WebSocket (/v1/realtime)
          │                    │
          │                    ▼
          │             Server VAD (webrtcvad)
@@ -56,15 +54,11 @@ Browser mic (24k PCM)  ──► Socket.IO / WebSocket
 
 * **Realtime transcription pipeline** powered by Whisper with optional diarization.
 * **Translation cache** with `lru_cache` to reduce latency/cost.
-* **Realtime streaming** (`/realtime` namespace):
-
-  * Server-side **VAD** parameters configurable via session update.
-  * Emits `transcript_temp` and `transcript_final` as soon as chunks resolve.
-  * Streams TTS audio back in small hops for low latency.
-* **OpenAI-like Realtime bridge** (`/v1/realtime`):
-
-  * Accepts `input_audio_buffer.append` events with base64 PCM24k.
-  * Responds with `response.output_text.delta` and audio frames.
+* **OpenAI-like realtime bridge** (`/v1/realtime`):
+  * Accepts `input_audio_buffer.append` events with base64 PCM24k frames.
+  * Optional **server-side VAD** (configurable via `session.update`).
+  * Streams text deltas and PCM24k audio chunks back to the client.
+  * Supports response cancellation and auto-response generation triggered by VAD.
 * **Token gate** for realtime endpoints via `API_TOKENS`.
 
 ---
@@ -73,27 +67,26 @@ Browser mic (24k PCM)  ──► Socket.IO / WebSocket
 
 * Python 3.10+
 * **ffmpeg** installed and available on `$PATH` (used for (de)muxing & resampling)
-* A reachable **Whisper** API endpoint and **TTS** endpoint
+* Reachable **Whisper**, **LLM**, and **TTS** HTTP endpoints
 
-Suggested packages (see your `requirements.txt`):
+Required Python packages (see `requirements.txt`):
 
 ```
-flask
-flask-cors
-flask-socketio
-flask-sock
+fastapi
+uvicorn[standard]
 requests
 numpy
 webrtcvad
+websockets
 ```
 
 ---
 
 ## Quickstart
 
-### 1) Environment
+### 1) Environment variables
 
-Create a `.env` or export environment variables (see [Configuration](#configuration)):
+Create a `.env` file or export the environment variables described in [Configuration](#configuration). A minimal setup looks like:
 
 ```bash
 export AUDIO_API_KEY=...          # Whisper backend
@@ -103,24 +96,26 @@ export OPENAI_API_MODEL=gpt-oss
 export TTS_API_KEY=...
 export TTS_API_URL=https://api-txt2audio.cloud-pi-native.com/v1/audio/speech
 export DIARIZATION_TOKEN=...      # optional
-export API_TOKENS="token1,token2" # optional auth for realtime
+export API_TOKENS="token1,token2" # optional auth for realtime WebSocket
+export SERVER_NAME=0.0.0.0        # optional host binding
+export SERVER_PORT=8080           # optional port binding
 ```
 
 ### 2) Install & run
 
 ```bash
 pip install -r requirements.txt
-python app.py  # or: gunicorn -k eventlet -w 1 app:sio --bind 0.0.0.0:5001
+uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws websockets
 ```
 
-> Note: `SocketIO` server is exposed via `sio.run(...)`. For production, prefer Gunicorn + Eventlet/Gevent (see [Deployment](#deployment)).
+> Alternatively run `python app.py` which bootstraps `uvicorn` with the same defaults.
 
 ---
 
 ## Configuration
 
 | Variable            | Required                 | Default                                                             | Description                                                                    |
-| ------------------- | ------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| ------------------- | ------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `AUDIO_API_KEY`     | ✅                        | –                                                                   | API key for Whisper transcription backend.                                     |
 | `OPENAI_API_KEY`    | ✅                        | –                                                                   | API key for OpenAI-compatible chat endpoint (translations, simple replies).    |
 | `OPENAI_API_BASE`   | ✅ (if not default)       | ``                                                                  | Base URL for OpenAI-compatible API (must expose `/chat/completions`).          |
@@ -133,48 +128,22 @@ python app.py  # or: gunicorn -k eventlet -w 1 app:sio --bind 0.0.0.0:5001
 | `REQUEST_TIMEOUT`   | ❌                        | `30`                                                                | HTTP timeout (seconds) for upstream calls.                                     |
 | `MAX_CACHE_SIZE`    | ❌                        | `256`                                                               | LRU cache entries for translations.                                            |
 | `VAD_AGGR`          | ❌                        | `2`                                                                 | Default VAD aggressiveness (0..3).                                             |
-| `API_TOKENS`        | ❌                        | –                                                                   | Comma-separated tokens to allow access to realtime endpoints. Empty = no auth. |
-| `SERVER_NAME`       | ❌                        | `0.0.0.0`                                                           | Bind address.                                                                  |
-| `SERVER_PORT`       | ❌                        | `5001`                                                              | Bind port.                                                                     |
+| `API_TOKENS`        | ❌                        | –                                                                   | Comma-separated tokens to allow access to realtime endpoint. Empty = no auth.  |
+| `SERVER_NAME`       | ❌                        | `0.0.0.0`                                                           | Bind address for the FastAPI/uvicorn server.                                   |
+| `SERVER_PORT`       | ❌                        | `8080`                                                              | Bind port for the FastAPI/uvicorn server.                                      |
 
 **Audio formats**
 
 * **Input** realtime: base64 **PCM16** at **24 kHz** (frame size = 20 ms, 960 bytes).
 * Whisper upload: `audio/webm` (Opus) is produced internally from PCM using `ffmpeg`.
-* TTS: external API returns WebM/Opus; helper converts to **PCM16 16 kHz** where needed.
+* TTS: external API returns WebM/Opus; helper converts to **PCM16 24 kHz** for streaming and **16 kHz** where needed.
 
 ---
 
-## Realtime — Socket.IO
+## Realtime WebSocket Bridge (`/v1/realtime`)
 
-* Namespace: **`/realtime`**
-* Auth: optional Bearer token in `Authorization` header, `auth` payload, or querystring (`token=` / `access_token=`). Controlled by `API_TOKENS`.
-
-**Server events → client**
-
-* `message` with shapes:
-
-  * `{ "type":"connected", "content": {"engine":"internal", "sr":24000} }`
-  * `{ "type":"event", "content": {"type":"turn.start"} }`
-  * `{ "type":"transcript_temp", "content":"partial text" }`
-  * `{ "type":"transcript_final", "content":"final text" }`
-  * `{ "type":"audio", "content":"<base64 pcm24k chunk>" }`
-  * `{ "type":"turn_done" }`
-  * `{ "type":"error", "content":"..." }`
-
-**Client → server**
-
-* `update_session`: `{ session: { voice?: string, turn_detection?: { type: "server_vad", aggressiveness?: 0..3, start_ms?, end_ms?, pad_ms?, max_ms? } } }`
-* `audio`: `{ audio: "<base64 pcm24k>" , commit?: true }`
-* `commit`: no payload; forces current segment commit.
-* `system_prompt`: (no-op placeholder)
-
----
-
-## Realtime — WebSocket Bridge (`/v1/realtime`)
-
-* Plain WebSocket endpoint mimicking an OpenAI Realtime flow.
-* Auth: optional Bearer token or `?token=` in query (depends on `API_TOKENS`).
+* FastAPI WebSocket endpoint mimicking an OpenAI Realtime flow.
+* Auth: optional Bearer token, `?token=` query parameter, or `Sec-WebSocket-Protocol: openai-insecure-api-key.<token>` (when `API_TOKENS` is configured).
 
 **Client → server events**
 
@@ -182,53 +151,31 @@ python app.py  # or: gunicorn -k eventlet -w 1 app:sio --bind 0.0.0.0:5001
 * `conversation.item.create`: `{ "item": { "id?": "...", "type":"message", "role":"user", "content":[ {"type":"input_text", "text":"..."} ] } }`
 * `input_audio_buffer.append`: `{ "audio": "<base64 pcm24k>" }`
 * `input_audio_buffer.commit`: no payload → triggers transcription
+* `input_audio_buffer.clear`: clears buffered audio / VAD state
 * `conversation.item.retrieve` / `conversation.item.delete`
 * `response.create`: no payload → generates reply + audio
+* `response.cancel`: cancel the currently streaming response (if IDs match)
 
 **Server → client events**
 
 * `session.created`, `session.updated`
 * `conversation.item.created` / `retrieved` / `deleted`
+* `conversation.item.input_audio_transcription.completed`: Whisper transcription result for committed audio
 * `response.output_text.delta`: text token(s)
 * `response.audio.delta`: base64 PCM24k chunks
 * `response.done`: end of response
+* `response.cancelled`: emitted when the server cancels a response because of client request or VAD interruption
 * `error`: `{ error: { message: "..." } }`
 
 ---
 
 ## Examples
 
-### Minimal Socket.IO client (browser)
-
-```html
-<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-<script>
-const sr = 24000;
-const socket = io("http://localhost:5001/realtime", {
-  transports: ["websocket"],
-  auth: { token: "YOUR_TOKEN_IF_ANY" }
-});
-
-socket.on("message", (m) => {
-  if (m.type === "audio") {
-    // decode base64 PCM24 and play with WebAudio (left as an exercise)
-  } else {
-    console.log("server:", m);
-  }
-});
-
-// send 24kHz PCM16 frames (base64) periodically
-function sendChunk(b64, commit=false){
-  socket.emit("audio", { audio: b64, commit });
-}
-</script>
-```
-
-### WebSocket bridge (Node.js)
+### Node.js WebSocket client
 
 ```js
 import WebSocket from "ws";
-const ws = new WebSocket("ws://localhost:5001/v1/realtime", {
+const ws = new WebSocket("ws://localhost:8080/v1/realtime", {
   headers: { Authorization: "Bearer TOKEN" }
 });
 ws.on("open", () => {
@@ -241,18 +188,38 @@ ws.on("open", () => {
 ws.on("message", (d) => console.log(JSON.parse(d.toString())));
 ```
 
+### Python client snippet
+
+```python
+import asyncio
+import base64
+import websockets
+
+async def main():
+    uri = "ws://localhost:8080/v1/realtime"
+    async with websockets.connect(uri, extra_headers={"Authorization": "Bearer TOKEN"}) as ws:
+        await ws.send('{"type": "session.update", "session": {"voice": "shimmer"}}')
+        # send PCM16 (24 kHz) audio
+        await ws.send('{"type": "input_audio_buffer.append", "audio": "' + base64.b64encode(b"\x00\x00" * 960).decode() + '"}')
+        await ws.send('{"type": "input_audio_buffer.commit"}')
+        await ws.send('{"type": "response.create"}')
+        async for message in ws:
+            print(message)
+
+asyncio.run(main())
+```
+
 ---
 
 ## Deployment
 
-* **Production server**: prefer `gunicorn` with **eventlet** or **gevent** workers for WebSockets.
+* **Production server**: run `uvicorn` (or `hypercorn`) with WebSocket support. Example:
 
   ```bash
-  pip install gunicorn eventlet
-  gunicorn -k eventlet -w 1 app:sio --bind 0.0.0.0:5001
+  uvicorn app:app --host 0.0.0.0 --port 8080 --ws websockets
   ```
-* **Containers**: ensure `ffmpeg` is present in the image.
-* **Scaling**: Socket sessions are in-memory per process; for multi-instance scaling, configure a message queue (e.g., Redis) via Flask-SocketIO if you need cross-instance events.
+* **Containers**: ensure `ffmpeg` binary is present in the image.
+* **Scaling**: conversation state lives in-memory per process; use sticky sessions or external state if horizontal scaling is required.
 * **CPU/GPU**: ASR/TTS are upstream services; this app mainly does muxing/resampling (CPU-bound) and I/O.
 
 ---
