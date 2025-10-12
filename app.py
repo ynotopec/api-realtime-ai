@@ -21,9 +21,13 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 
 # ────────────────────────────── Config & logging ──────────────────────────────
-LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
-logging.basicConfig(level=LOG_LEVEL, format='[%(levelname)s] %(asctime)s – %(message)s')
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s – %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def log(message: str, *args: Any, **kwargs: Any) -> None:
+    """Adapter retained for backward compatibility with existing log() calls."""
+    logger.info(message, *args, **kwargs)
 
 
 def _summarize_payload(payload: Any, *, limit: int = 200) -> str:
@@ -49,7 +53,6 @@ def _summarize_payload(payload: Any, *, limit: int = 200) -> str:
 
 
 class Cfg:
-    LOG_LEVEL = LOG_LEVEL
     AUDIO_API_KEY = os.getenv('AUDIO_API_KEY')
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
     OPENAI_API_BASE = os.getenv('OPENAI_API_BASE', '')
@@ -99,14 +102,14 @@ def post(url: str, **kwargs: Any) -> requests.Response:
     """POST wrapper that centralises logging, timeouts and error handling."""
     kwargs.setdefault("timeout", Cfg.REQUEST_TIMEOUT)
     payload_preview = _preview_payload(kwargs)
-    logger.debug(
+    log(
         "[IO][HTTP][OUTBOUND] POST %s opts={'timeout': %s} payload=%s",
         url,
         kwargs.get("timeout"),
         payload_preview,
     )
     response = session.post(url, **kwargs)
-    logger.debug(
+    log(
         "[IO][HTTP][OUTBOUND][RESPONSE] url=%s status=%s length=%s",
         url,
         response.status_code,
@@ -197,7 +200,7 @@ def call_diarization(file, target_lang: str) -> Dict[str, Any]:
     try:
         return post(Cfg.DIAR_URL, headers={'Authorization': f'Bearer {Cfg.DIAR_TOKEN}'}, files=files).json()
     except Exception as e:
-        logger.warning(f'[DIARIZATION ERROR] {e}')
+        log(f'[DIARIZATION ERROR] {e}')
         return {}
 
 
@@ -226,93 +229,37 @@ def build_translations(txt: str, detected: str, primary: str, target: str) -> Di
         try:
             out[f'translation_{lg}'] = translate_text(txt, lg)
         except Exception as e:
-            logger.warning(f'[TRANSLATION ERROR target={lg}] {e}')
+            log(f'[TRANSLATION ERROR target={lg}] {e}')
             out[f'translation_{lg}'] = txt
     return out
 
 
-# ▼▼▼ NEW STREAMING TTS FUNCTION ▼▼▼
-def stream_tts_pcm_24k(text: str, voice: str, instructions: str) -> Iterable[bytes]:
-    """
-    Calls the TTS API and streams the audio, converting it on-the-fly to 24kHz PCM.
-    This function is a generator, yielding chunks of raw PCM audio.
-    """
+def call_tts_webm(text: str, voice: str, instructions: str) -> bytes:
     payload = {
         'model': 'gpt-4o-mini-tts',
         'input': text,
         'voice': voice,
         'instructions': instructions,
-        'response_format': 'opus'  # Opus is efficient for streaming
+        'response_format': 'opus'
     }
-    
-    # ffmpeg command to read opus from stdin, and output 24kHz 16-bit mono PCM to stdout
-    command = [
-        'ffmpeg', '-y',
-        '-i', 'pipe:0',
-        '-ar', str(REALTIME_SR),
-        '-f', 's16le',
-        '-ac', '1',
-        '-acodec', 'pcm_s16le',
-        'pipe:1'
-    ]
-    
-    process = None
-    try:
-        # Use Popen to have access to stdin/stdout streams, redirecting stderr to null
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        
-        # Make the API call in streaming mode
-        with session.post(
-            Cfg.TTS_URL,
-            headers={'Authorization': f'Bearer {Cfg.TTS_API_KEY}', 'Content-Type': 'application/json'},
-            json=payload,
-            stream=True,
-            timeout=Cfg.REQUEST_TIMEOUT
-        ) as response:
-            logger.debug(
-                "[IO][HTTP][TTS][RESPONSE] url=%s status=%s",
-                Cfg.TTS_URL,
-                response.status_code
-            )
-            response.raise_for_status()
-            
-            # Read from API and write to ffmpeg's stdin in chunks
-            for chunk in response.iter_content(chunk_size=4096):
-                if chunk and process.stdin:
-                    try:
-                        process.stdin.write(chunk)
-                    except (BrokenPipeError, OSError):
-                        # ffmpeg might have closed its stdin if it has enough data
-                        logger.debug("[TTS STREAM] ffmpeg stdin pipe broken, likely closed.")
-                        break
-            
-            if process.stdin:
-                process.stdin.close() # Signal ffmpeg that we are done writing
+    return post(
+        Cfg.TTS_URL,
+        headers={'Authorization': f'Bearer {Cfg.TTS_API_KEY}', 'Content-Type': 'application/json'},
+        json=payload
+    ).content
 
-        # Read from ffmpeg's stdout and yield chunks
-        # Read chunks of ~60ms to send to the client
-        chunk_size = int(REALTIME_SR * 0.25) * BYTES_PER_SAMPLE
-        while True:
-            if process.stdout:
-                output_chunk = process.stdout.read(chunk_size)
-                if output_chunk:
-                    yield output_chunk
-                else:
-                    break # No more output
-            else:
-                break
-                
-        process.wait(timeout=5) # Wait for ffmpeg to finish
 
-    except Exception as e:
-        logger.error(f"[TTS STREAM ERROR] {e}")
-        raise
-    finally:
-        # Make sure process is terminated if something went wrong
-        if process and process.poll() is None:
-            logger.debug("[TTS STREAM] Terminating ffmpeg process.")
-            process.terminate()
-            process.wait()
+def call_tts_pcm16le(text: str, voice: str, instructions: str) -> bytes:
+    webm = call_tts_webm(text, voice, instructions)
+    with tempfile.NamedTemporaryFile(suffix='.webm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
+        fi.write(webm)
+        fi.flush()
+        subprocess.check_output(
+            ['ffmpeg', '-y', '-i', fi.name, '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', fo.name],
+            stderr=subprocess.DEVNULL
+        )
+        fo.seek(0)
+        return fo.read()
 
 
 def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
@@ -339,6 +286,19 @@ def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
     return np.clip(out, -32768.0, 32767.0).astype(np.int16, copy=False).tobytes()
 
 
+def _resample_pcm_ffmpeg(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix='.pcm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
+        fi.write(pcm)
+        fi.flush()
+        subprocess.check_output(
+            ['ffmpeg', '-y', '-f', 's16le', '-ar', str(sr_in), '-ac', '1', '-i', fi.name,
+             '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', str(sr_out), '-ac', '1', fo.name],
+            stderr=subprocess.DEVNULL
+        )
+        fo.seek(0)
+        return fo.read()
+
+
 def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
     f_pcm = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
     f_webm = tempfile.NamedTemporaryFile(suffix='.webm', delete=False)
@@ -359,7 +319,6 @@ def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
     finally:
         try:
             f_pcm.close()
-            os.unlink(f_pcm.name)
         except Exception:
             pass
         try:
@@ -493,39 +452,33 @@ async def _send_ws_json_async(
     try:
         serialized = json.dumps(payload)
     except Exception as exc:
-        logger.error("[IO][WS][SEND][SERDE_ERROR] %s", exc)
+        log("[IO][WS][SEND][SERDE_ERROR] %s", exc)
         return
 
     try:
         if lock:
             async with lock:
-                logger.debug("[IO][WS][SEND] %s", _summarize_payload(payload))
+                log("[IO][WS][SEND] %s", _summarize_payload(payload))
                 await ws.send_text(serialized)
         else:
-            logger.debug("[IO][WS][SEND] %s", _summarize_payload(payload))
+            log("[IO][WS][SEND] %s", _summarize_payload(payload))
             await ws.send_text(serialized)
     except Exception as exc:
-        logger.error("[IO][WS][SEND][ERROR] %s", exc)
+        log("[IO][WS][SEND][ERROR] %s", exc)
 
 
 def _transcribe_24k_pcm(pcm24: bytes) -> str:
     path = _pcm24k_to_webm_for_whisper(pcm24)
     class DF:
         filename = 'audio.webm'
-        stream = None
-        content_length = 0
     df = DF()
+    df.stream = open(path, 'rb')
+    df.content_length = os.path.getsize(path)
     try:
-        df.stream = open(path, 'rb')
-        df.content_length = os.path.getsize(path)
         return (call_whisper(df) or {}).get('text', '').strip()
     finally:
-        if df.stream:
-            df.stream.close()
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
+        df.stream.close()
+        os.unlink(path)
 
 
 def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
@@ -564,12 +517,12 @@ def _prune_history(st: WSConv, max_items: int = int(os.getenv('MAX_HISTORY_ITEMS
 @app.websocket('/v1/realtime')
 async def realtime_ws_endpoint(websocket: WebSocket):
     if not _ws_auth_ok_fastapi(websocket):
-        logger.warning('[REALTIME][WS] unauthorized websocket attempt rejected')
+        log('[REALTIME][WS] unauthorized websocket attempt rejected')
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
     await websocket.accept()
-    logger.info('[REALTIME][WS] connection accepted')
+    log('[REALTIME][WS] connection accepted')
 
     loop = asyncio.get_running_loop()
     send_lock = asyncio.Lock()
@@ -587,7 +540,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
             try:
                 fut.result(timeout=0.1)  # Non-blocking check for immediate errors
             except Exception as e:
-                logger.warning(f"[IO][WS][SEND][THREAD_ERROR] {e}")
+                log(f"[IO][WS][SEND][THREAD_ERROR] {e}")
         future.add_done_callback(log_exception)
 
     st.session.setdefault('sr', REALTIME_SR)
@@ -629,12 +582,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         current_resp['id'] = rid
         current_resp['cancelled'] = False
 
-        try:
-            ans = _llm_reply_from_history(st)
-            if not ans:
-                logger.debug("[LLM] LLM returned an empty response.")
-                response_done(rid, asst_item_id)
-                return
+        try: ans = _llm_reply_from_history(st)
         except Exception as e:
             send_from_thread(openai_error(f'llm failed: {e}', 'internal_error', None, 500))
             response_done(rid, asst_item_id)
@@ -648,33 +596,22 @@ async def realtime_ws_endpoint(websocket: WebSocket):
             accum.append(piece)
             response_text_delta(rid, asst_item_id, piece)
 
-        if not current_resp['cancelled']:
-            response_text_done(rid, asst_item_id, "".join(accum))
-        else:
-            response_done(rid, asst_item_id)
-            return
+        if not current_resp['cancelled']: response_text_done(rid, asst_item_id, "".join(accum))
+        else: response_done(rid, asst_item_id); return
 
         voice = st.session.get('voice', 'shimmer')
         tts_instructions = st.session.get('instructions', 'Speak clearly and positively.')
-        
-        # ▼▼▼ MODIFIED TTS STREAMING SECTION ▼▼▼
         try:
             if not current_resp['cancelled']:
-                # Use the streaming generator to get audio chunks on-the-fly
-                for pcm24_chunk in stream_tts_pcm_24k(ans, voice, tts_instructions):
+                pcm16 = call_tts_pcm16le(ans, voice, tts_instructions)
+                pcm24 = _resample_pcm_ffmpeg(pcm16, 16000, REALTIME_SR)
+                hop = int(REALTIME_SR * 0.2) * 2
+                for i in range(0, len(pcm24), hop):
                     if current_resp['cancelled']:
-                        send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
-                        break
-                    if pcm24_chunk:
-                        response_audio_delta(rid, asst_item_id, _b64(pcm24_chunk))
-                
-                if not current_resp['cancelled']:
-                    response_audio_done(rid, asst_item_id)
-
-        except Exception as e:
-            logger.error(f"[TTS ERROR in _handle_response_create] {e}", exc_info=True)
-            send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
-        # ▲▲▲ END OF MODIFIED SECTION ▲▲▲
+                        send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}}); break
+                    response_audio_delta(rid, asst_item_id, _b64(pcm24[i:i + hop]))
+                if not current_resp['cancelled']: response_audio_done(rid, asst_item_id)
+        except Exception as e: send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
 
         response_done(rid, asst_item_id)
         st.add({'id': asst_item_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': ans}]})
@@ -717,11 +654,11 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                     st.add(user_item); _prune_history(st)
                     await send_async({'type': 'conversation.item.created', 'item': user_item})
                     try: tr = _transcribe_24k_pcm(b) if b else ''
-                    except Exception as e: logger.warning(f"[REALTIME][WS][VAD][WHISPER] transcription error: {e}"); tr = ''
+                    except Exception as e: log(f"[REALTIME][WS][VAD][WHISPER] transcription error: {e}"); tr = ''
                     await send_async({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr})
                     st.items = [({'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'transcript': tr}]} if x['id'] == uid else x) for x in st.items]
                     if vad_state.get('auto_create_response'): _start_response_thread()
-                except Exception as exc: logger.error(f"[REALTIME][WS][VAD][COMMIT] error: {exc}")
+                except Exception as exc: log(f"[REALTIME][WS][VAD][COMMIT] error: {exc}")
 
     async def _on_append_feed_vad(chunk_bytes):
         td_local = st.session.get('turn_detection', {}) or {}
@@ -733,7 +670,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         while len(st.audio) >= BPC_24K:
             f24 = bytes(st.audio[:BPC_24K]); del st.audio[:BPC_24K]
             try: v = vad_state['vad'].is_speech(_resample_24k_to_16k_linear(f24), 16000)
-            except Exception as e: logger.warning(f"[REALTIME][WS][VAD] vad error: {e}"); v = False
+            except Exception as e: log(f"[REALTIME][WS][VAD] vad error: {e}"); v = False
             vad_state['_frames'].append({'b24': f24, 'v': v})
             await _process_vad_buffer()
 
@@ -744,7 +681,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
             try: d = json.loads(msg)
             except Exception: await send_async(openai_error('invalid JSON', 'client_error', None, 400)); continue
             t = d.get('type')
-            logger.debug(f"[REALTIME][WS] received type={t}")
+            log(f"[REALTIME][WS] received type={t}")
 
             if t == 'session.update':
                 sess = d.get('session') or {}
@@ -783,12 +720,12 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 vad_state['_frames'].clear(); vad_state['_trig'] = False; vad_state['_start_idx'] = None; vad_state['_v'] = vad_state['_nv'] = 0
                 await send_async({"type": "input_audio_buffer.committed"})
                 try: tr = _transcribe_24k_pcm(pcm) if pcm else ''
-                except Exception as e: logger.warning(f"[REALTIME][WS][WHISPER] transcription error: {e}"); tr = ''
+                except Exception as e: log(f"[REALTIME][WS][WHISPER] transcription error: {e}"); tr = ''
                 await send_async({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr})
                 st.items = [({'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'transcript': tr}]} if x['id'] == uid else x) for x in st.items]
                 td = st.session.get('turn_detection', {}) or {}
                 if (td.get('type') == 'server_vad' and vad_state.get('auto_create_response')) or os.getenv('COMMIT_AUTORESP', '1') == '1':
-                    logger.debug("[REALTIME][WS][COMMIT] auto_create_response → response.create()")
+                    log("[REALTIME][WS][COMMIT] auto_create_response → response.create()")
                     _start_response_thread()
             elif t == 'conversation.item.create':
                 it = d.get('item') or {}
@@ -816,11 +753,11 @@ async def realtime_ws_endpoint(websocket: WebSocket):
             else:
                 await send_async(openai_error(f'unhandled type: {t}', 'client_error', None, 400))
     except WebSocketDisconnect:
-        logger.info('[REALTIME][WS] client disconnected')
+        log('[REALTIME][WS] client disconnected')
     except Exception as e:
-        logger.error(f'[REALTIME][WS] an error occurred in main loop: {e}', exc_info=True)
+        log(f'[REALTIME][WS] an error occurred in main loop: {e}', exc_info=True)
     finally:
-        logger.info(f'[REALTIME][WS] connection closed for {websocket.client}')
+        log(f'[REALTIME][WS] connection closed for {websocket.client}')
 
 
 # ────────────────────────────── Entrypoint ──────────────────────────────
@@ -828,10 +765,10 @@ async def realtime_ws_endpoint(websocket: WebSocket):
 # uvicorn app:app --host 0.0.0.0 --port 8080 --ws websockets
 #
 # Example using environment variables:
-# LOG_LEVEL=DEBUG uvicorn app:app --host 0.0.0.0 --port 8080 --ws websockets
+# SERVER_PORT=8080 SERVER_NAME=0.0.0.0 uvicorn app:app --host "$SERVER_NAME" --port "$SERVER_PORT" --ws websockets
 if __name__ == '__main__':
     import uvicorn
     port = int(os.getenv('SERVER_PORT', 8080))
     host = os.getenv('SERVER_NAME', '0.0.0.0')
-    logger.info(f"[BOOT] FastAPI WS Realtime server starting on {host}:{port}")
+    log(f"[BOOT] FastAPI WS Realtime server starting on {host}:{port}")
     uvicorn.run(app, host=host, port=port, ws="websockets")
