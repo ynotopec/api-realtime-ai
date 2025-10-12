@@ -1,0 +1,14 @@
+# Web Framework & Server
+fastapi
+uvicorn[standard]
+
+# External API Communication
+requests
+
+# Audio Processing
+numpy
+webrtcvad
+
+# WebSocket implementation is included in uvicorn[standard]
+# or can be listed explicitly:
+websockets
