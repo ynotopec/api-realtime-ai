@@ -105,6 +105,7 @@ class Cfg:
     DEFAULT_VAD_END_MS = _env_int('DEFAULT_VAD_END_MS', 450, minimum=60)
     DEFAULT_VAD_PAD_MS = _env_int('DEFAULT_VAD_PAD_MS', 180, minimum=0)
     DEFAULT_VAD_MAX_MS = _env_int('DEFAULT_VAD_MAX_MS', 5000, minimum=20)
+    DEFAULT_VAD_MIN_VOICE_MS = _env_int('DEFAULT_VAD_MIN_VOICE_MS', 3000, minimum=0)
     DEFAULT_VAD_AUTORESP = _coerce_bool(os.getenv('DEFAULT_VAD_AUTORESP'), True)
     DEFAULT_VAD_INTERRUPT_RESPONSE = _coerce_bool(os.getenv('DEFAULT_VAD_INTERRUPT_RESPONSE'), False)
 
@@ -524,6 +525,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         'end_ms': Cfg.DEFAULT_VAD_END_MS,
         'pad_ms': Cfg.DEFAULT_VAD_PAD_MS,
         'max_ms': max(Cfg.DEFAULT_VAD_MAX_MS, Cfg.DEFAULT_VAD_END_MS + Cfg.DEFAULT_VAD_PAD_MS, Cfg.DEFAULT_VAD_START_MS + 20),
+        'min_voice_ms': Cfg.DEFAULT_VAD_MIN_VOICE_MS,
         '_frames': [], '_trig': False, '_start_idx': None, '_v': 0, '_nv': 0,
         'auto_create_response': Cfg.DEFAULT_VAD_AUTORESP,
         'interrupt_response': Cfg.DEFAULT_VAD_INTERRUPT_RESPONSE,
@@ -622,6 +624,16 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 vad_state['_trig'] = False; vad_state['_start_idx'] = None; vad_state['_v'] = vad_state['_nv'] = 0
                 log(f"[REALTIME][WS][VAD] turn committed reason={reason} frames={i1 - i0}")
                 await send_async({"type": "input_audio_buffer.speech_stopped"})
+                min_voice_ms = max(0, int(vad_state.get('min_voice_ms', 0)))
+                min_voice_frames = (min_voice_ms + FRAME_MS - 1) // FRAME_MS if min_voice_ms else 0
+                chunk_frames = i1 - i0
+                if min_voice_frames and chunk_frames < min_voice_frames:
+                    log(
+                        "[REALTIME][WS][VAD] ignoring short chunk duration_ms=%s threshold_ms=%s",
+                        chunk_frames * FRAME_MS,
+                        min_voice_ms,
+                    )
+                    return
                 try:
                     uid = _nid('item')
                     user_item = {'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'mime_type': f'audio/pcm;rate={REALTIME_SR}'}]}
@@ -679,6 +691,8 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                             ('start_ms', 'start_ms', 20),
                             ('end_ms', 'end_ms', 60),
                             ('pad_ms', 'pad_ms', 0),
+                            ('min_voice_ms', 'min_voice_ms', 0),
+                            ('min_speech_ms', 'min_voice_ms', 0),
                         )
                         for src, dest, minimum in ms_fields:
                             if src in td:
@@ -701,6 +715,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                         td.setdefault('start_ms', vad_state['start_ms'])
                         td.setdefault('end_ms', vad_state['end_ms'])
                         td.setdefault('pad_ms', vad_state['pad_ms'])
+                        td.setdefault('min_voice_ms', vad_state['min_voice_ms'])
                         td.setdefault('aggressiveness', vad_state['aggr'])
                         td.setdefault('create_response', vad_state['auto_create_response'])
                         td.setdefault('interrupt_response', vad_state['interrupt_response'])
