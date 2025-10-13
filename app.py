@@ -533,6 +533,12 @@ async def realtime_ws_endpoint(websocket: WebSocket):
 
     # Core response generator (runs in a thread)
     def _handle_response_create():
+        messages = _messages_from_items(st)
+        if not messages or messages[-1].get('role') != 'user':
+            log("[REALTIME][WS][RESP] skipped response.create → no user message available")
+            send_from_thread(openai_error('no user message to respond to', 'client_error', None, 400))
+            return
+
         def resp_created(rid): send_from_thread({'type': 'response.created', 'response': {'id': rid}})
         def response_text_delta(rid, item_id, token):
             send_from_thread({"type": "response.output_text.delta", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "delta": token})
@@ -641,9 +647,10 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                     await send_async({'type': 'conversation.item.created', 'item': user_item})
                     try: tr = _transcribe_24k_pcm(b) if b else ''
                     except Exception as e: log(f"[REALTIME][WS][VAD][WHISPER] transcription error: {e}"); tr = ''
-                    await send_async({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr})
-                    st.items = [({'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'transcript': tr}]} if x['id'] == uid else x) for x in st.items]
-                    if vad_state.get('auto_create_response'): _start_response_thread()
+                    tr_norm = tr.strip()
+                    await send_async({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr_norm})
+                    st.items = [({'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'transcript': tr_norm}]} if x['id'] == uid else x) for x in st.items]
+                    if vad_state.get('auto_create_response') and tr_norm: _start_response_thread()
                 except Exception as exc: log(f"[REALTIME][WS][VAD][COMMIT] error: {exc}")
 
     async def _on_append_feed_vad(chunk_bytes):
@@ -741,10 +748,11 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 await send_async({"type": "input_audio_buffer.committed"})
                 try: tr = _transcribe_24k_pcm(pcm) if pcm else ''
                 except Exception as e: log(f"[REALTIME][WS][WHISPER] transcription error: {e}"); tr = ''
-                await send_async({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr})
-                st.items = [({'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'transcript': tr}]} if x['id'] == uid else x) for x in st.items]
+                tr_norm = tr.strip()
+                await send_async({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr_norm})
+                st.items = [({'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'transcript': tr_norm}]} if x['id'] == uid else x) for x in st.items]
                 td = st.session.get('turn_detection', {}) or {}
-                if (td.get('type') == 'server_vad' and vad_state.get('auto_create_response')) or os.getenv('COMMIT_AUTORESP', '1') == '1':
+                if ((td.get('type') == 'server_vad' and vad_state.get('auto_create_response')) or os.getenv('COMMIT_AUTORESP', '1') == '1') and tr_norm:
                     log("[REALTIME][WS][COMMIT] auto_create_response → response.create()")
                     _start_response_thread()
             elif t == 'conversation.item.create':
