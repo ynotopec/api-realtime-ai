@@ -27,6 +27,39 @@ def log(message: str, *args: Any, **kwargs: Any) -> None:
     logger.info(message, *args, **kwargs)
 
 
+def _coerce_int(value: Any, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    """Convert arbitrary values to bounded integers with a fallback."""
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        coerced = default
+    if minimum is not None:
+        coerced = max(minimum, coerced)
+    if maximum is not None:
+        coerced = min(maximum, coerced)
+    return coerced
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """Normalise truthy/falsey inputs from JSON payloads and env vars."""
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in {'1', 'true', 'yes', 'on'}:
+            return True
+        if value in {'0', 'false', 'no', 'off'}:
+            return False
+        return default
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    """Fetch an integer environment variable with optional bounds and fallback."""
+    raw = os.getenv(name)
+    return _coerce_int(raw, default, minimum=minimum, maximum=maximum)
+
+
 def _summarize_payload(payload: Any, *, limit: int = 200) -> str:
     try:
         if payload is None:
@@ -57,7 +90,23 @@ class Cfg:
     WHISPER_URL = os.getenv('WHISPER_URL', 'https://api-audio2txt.cloud-pi-native.com/v1/audio/transcriptions')
     TTS_API_KEY = os.getenv('TTS_API_KEY')
     TTS_URL = os.getenv('TTS_API_URL', 'https://api-txt2audio.cloud-pi-native.com/v1/audio/speech')
-    REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '30'))
+    REQUEST_TIMEOUT = _env_int('REQUEST_TIMEOUT', 30, minimum=1)
+    DEFAULT_SYSTEM_PROMPT = os.getenv(
+        'DEFAULT_SYSTEM_PROMPT',
+        'You are a concise, upbeat assistant. Reply in short, clear sentences '
+        '(15 words maximum per sentence) and stay focused on the user request.',
+    )
+    DEFAULT_TTS_INSTRUCTIONS = os.getenv(
+        'DEFAULT_TTS_INSTRUCTIONS',
+        'Speak clearly and positively using short sentences and natural pauses.',
+    )
+    DEFAULT_VAD_AGGR = _env_int('DEFAULT_VAD_AGGR', 2, minimum=0, maximum=3)
+    DEFAULT_VAD_START_MS = _env_int('DEFAULT_VAD_START_MS', 120, minimum=20)
+    DEFAULT_VAD_END_MS = _env_int('DEFAULT_VAD_END_MS', 450, minimum=60)
+    DEFAULT_VAD_PAD_MS = _env_int('DEFAULT_VAD_PAD_MS', 180, minimum=0)
+    DEFAULT_VAD_MAX_MS = _env_int('DEFAULT_VAD_MAX_MS', 5000, minimum=20)
+    DEFAULT_VAD_AUTORESP = _coerce_bool(os.getenv('DEFAULT_VAD_AUTORESP'), True)
+    DEFAULT_VAD_INTERRUPT_RESPONSE = _coerce_bool(os.getenv('DEFAULT_VAD_INTERRUPT_RESPONSE'), False)
 
 
 for var_name in ("AUDIO_API_KEY", "OPENAI_API_KEY"):
@@ -394,9 +443,14 @@ def _transcribe_24k_pcm(pcm24: bytes) -> str:
 
 def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
     msgs: List[Dict[str, Any]] = []
+    system_prompts: List[str] = []
+    if Cfg.DEFAULT_SYSTEM_PROMPT:
+        system_prompts.append(Cfg.DEFAULT_SYSTEM_PROMPT)
     instr = st.session.get('instructions')
     if instr:
-        msgs.append({'role': 'system', 'content': instr})
+        system_prompts.append(instr)
+    if system_prompts:
+        msgs.append({'role': 'system', 'content': '\n\n'.join(system_prompts)})
 
     for it in st.items:
         if (it.get('type') != 'message') or (it.get('role') not in ('system', 'user', 'assistant')):
@@ -464,12 +518,15 @@ async def realtime_ws_endpoint(websocket: WebSocket):
     current_resp = {'id': None, 'cancelled': False}
 
     vad_state = {
-        'vad': webrtcvad.Vad(int(os.getenv('DEFAULT_VAD_AGGR', '2'))),
-        'aggr': int(os.getenv('DEFAULT_VAD_AGGR', '2')),
-        'start_ms': 80, 'end_ms': 300, 'pad_ms': 120, 'max_ms': 10_000,
+        'vad': webrtcvad.Vad(Cfg.DEFAULT_VAD_AGGR),
+        'aggr': Cfg.DEFAULT_VAD_AGGR,
+        'start_ms': Cfg.DEFAULT_VAD_START_MS,
+        'end_ms': Cfg.DEFAULT_VAD_END_MS,
+        'pad_ms': Cfg.DEFAULT_VAD_PAD_MS,
+        'max_ms': max(Cfg.DEFAULT_VAD_MAX_MS, Cfg.DEFAULT_VAD_END_MS + Cfg.DEFAULT_VAD_PAD_MS, Cfg.DEFAULT_VAD_START_MS + 20),
         '_frames': [], '_trig': False, '_start_idx': None, '_v': 0, '_nv': 0,
-        'auto_create_response': os.getenv('DEFAULT_VAD_AUTORESP', '1') == '1',
-        'interrupt_response': False
+        'auto_create_response': Cfg.DEFAULT_VAD_AUTORESP,
+        'interrupt_response': Cfg.DEFAULT_VAD_INTERRUPT_RESPONSE,
     }
 
     # Core response generator (runs in a thread)
@@ -511,7 +568,11 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         else: response_done(rid, asst_item_id); return
 
         voice = st.session.get('voice', 'shimmer')
-        tts_instructions = st.session.get('instructions', 'Speak clearly and positively.')
+        tts_instructions = (
+            st.session.get('tts_instructions')
+            or st.session.get('instructions')
+            or Cfg.DEFAULT_TTS_INSTRUCTIONS
+        )
         try:
             if not current_resp['cancelled']:
                 pcm16 = call_tts_pcm16le(ans, voice, tts_instructions)
@@ -550,6 +611,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
             vad_state['_nv'] = 0 if f['v'] else vad_state['_nv'] + 1
             dur = len(frames) - (vad_state['_start_idx'] or 0)
             if vad_state['_nv'] >= end_fr or dur >= max_fr:
+                reason = 'silence' if vad_state['_nv'] >= end_fr else 'max_duration'
                 end = min(len(frames), max((len(frames) - vad_state['_nv']) + pad_fr, (vad_state['_start_idx'] or 0) + 1))
                 i0 = vad_state['_start_idx'] or 0; i1 = end
                 if i1 <= i0:
@@ -558,6 +620,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 b = b''.join(fr['b24'] for fr in frames[i0:i1])
                 vad_state['_frames'] = frames[i1:]
                 vad_state['_trig'] = False; vad_state['_start_idx'] = None; vad_state['_v'] = vad_state['_nv'] = 0
+                log(f"[REALTIME][WS][VAD] turn committed reason={reason} frames={i1 - i0}")
                 await send_async({"type": "input_audio_buffer.speech_stopped"})
                 try:
                     uid = _nid('item')
@@ -599,17 +662,48 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 for k in ('input_audio_format', 'output_audio_format', 'voice', 'instructions'):
                     if k in sess: st.session[k] = sess[k]
                 if 'turn_detection' in sess:
-                    td = sess['turn_detection'] or {}
+                    td_in = sess['turn_detection'] or {}
+                    td = dict(td_in)
                     st.session['turn_detection'] = td
                     if td.get('type') == 'server_vad':
-                        aggr = int(td.get('aggressiveness', vad_state['aggr']))
+                        aggr = _coerce_int(td.get('aggressiveness'), vad_state['aggr'], minimum=0, maximum=3)
+                        td['aggressiveness'] = aggr
                         vad_state['aggr'] = aggr
-                        try: vad_state['vad'] = webrtcvad.Vad(aggr)
-                        except Exception: vad_state['vad'] = webrtcvad.Vad(vad_state['aggr'])
-                        for k in ('silence_duration_ms', 'prefix_padding_ms', 'start_ms', 'end_ms', 'pad_ms', 'max_ms'):
-                            if k in td: vad_state[k.replace('silence_duration', 'end').replace('prefix_padding', 'pad')] = int(td[k])
-                        for k in ('create_response', 'interrupt_response'):
-                            if k in td: vad_state[f'auto_{k}' if k == 'create_response' else k] = bool(td[k])
+                        try:
+                            vad_state['vad'] = webrtcvad.Vad(aggr)
+                        except Exception:
+                            vad_state['vad'] = webrtcvad.Vad(vad_state['aggr'])
+                        ms_fields = (
+                            ('silence_duration_ms', 'end_ms', 60),
+                            ('prefix_padding_ms', 'pad_ms', 0),
+                            ('start_ms', 'start_ms', 20),
+                            ('end_ms', 'end_ms', 60),
+                            ('pad_ms', 'pad_ms', 0),
+                        )
+                        for src, dest, minimum in ms_fields:
+                            if src in td:
+                                value = _coerce_int(td.get(src), vad_state[dest], minimum=minimum)
+                                td[src] = value
+                                vad_state[dest] = value
+                        if 'max_ms' in td:
+                            vad_state['max_ms'] = _coerce_int(td.get('max_ms'), vad_state['max_ms'], minimum=vad_state['end_ms'] + vad_state['pad_ms'])
+                        vad_state['max_ms'] = max(
+                            vad_state['max_ms'],
+                            vad_state['end_ms'] + vad_state['pad_ms'],
+                            vad_state['start_ms'] + FRAME_MS,
+                        )
+                        td['max_ms'] = vad_state['max_ms']
+                        for key, dest in (('create_response', 'auto_create_response'), ('interrupt_response', 'interrupt_response')):
+                            if key in td:
+                                flag = _coerce_bool(td.get(key), vad_state[dest])
+                                td[key] = flag
+                                vad_state[dest] = flag
+                        td.setdefault('start_ms', vad_state['start_ms'])
+                        td.setdefault('end_ms', vad_state['end_ms'])
+                        td.setdefault('pad_ms', vad_state['pad_ms'])
+                        td.setdefault('aggressiveness', vad_state['aggr'])
+                        td.setdefault('create_response', vad_state['auto_create_response'])
+                        td.setdefault('interrupt_response', vad_state['interrupt_response'])
                 session_payload = _session_payload(sess_id, st.session)
                 await send_async({'type': 'session.updated', 'session': session_payload})
             elif t == 'input_audio_buffer.append':
