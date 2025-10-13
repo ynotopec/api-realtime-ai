@@ -129,6 +129,7 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 | `DEFAULT_VAD_END_MS` | ❌                       | `450`                                                               | Required trailing silence (ms) before cutting a turn.                           |
 | `DEFAULT_VAD_PAD_MS` | ❌                       | `180`                                                               | Additional padding (ms) kept around detected speech.                            |
 | `DEFAULT_VAD_MAX_MS` | ❌                       | `5000`                                                              | Maximum turn length (ms) before force-closing a chunk.                          |
+| `DEFAULT_VAD_MIN_VOICE_MS` | ❌                | `3000`                                                              | Minimum voiced duration (ms) required before committing a turn.                 |
 | `DEFAULT_VAD_AUTORESP` | ❌                     | `1`                                                                 | Auto-trigger a response when VAD commits user speech.                           |
 | `DEFAULT_VAD_INTERRUPT_RESPONSE` | ❌          | `0`                                                                 | Interrupt streaming replies when new speech arrives via server VAD.             |
 | `API_TOKENS`        | ❌                        | –                                                                   | Comma-separated tokens to allow access to realtime endpoint. Empty = no auth.  |
@@ -137,7 +138,7 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 
 ### VAD tuning defaults
 
-Server-side VAD is opt-in (via `session.update`), but the defaults above help keep chunks aligned with spoken sentences. Lower `DEFAULT_VAD_END_MS` and `DEFAULT_VAD_MAX_MS` if you need quicker, more granular commits, or raise them when you prefer longer turns. Boolean toggles such as `DEFAULT_VAD_AUTORESP` accept `1/0`, `true/false`, `yes/no`, or `on/off`. All timings are expressed in milliseconds.
+Server-side VAD is opt-in (via `session.update`), but the defaults above help keep chunks aligned with spoken sentences. Lower `DEFAULT_VAD_END_MS` and `DEFAULT_VAD_MAX_MS` if you need quicker, more granular commits, or raise them when you prefer longer turns. `DEFAULT_VAD_MIN_VOICE_MS` enforces a minimum voiced duration before committing audio, helping to filter out short noise bursts. Boolean toggles such as `DEFAULT_VAD_AUTORESP` accept `1/0`, `true/false`, `yes/no`, or `on/off`. All timings are expressed in milliseconds.
 
 **Audio formats**
 
