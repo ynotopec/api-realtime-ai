@@ -122,10 +122,22 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 | `TTS_API_KEY`       | ❌ (required if TTS used) | –                                                                   | API key for TTS endpoint.                                                      |
 | `TTS_API_URL`       | ❌                        | `https://api-txt2audio.cloud-pi-native.com/v1/audio/speech`         | TTS endpoint.                                                                  |
 | `REQUEST_TIMEOUT`   | ❌                        | `30`                                                                | HTTP timeout (seconds) for upstream calls.                                     |
-| `VAD_AGGR`          | ❌                        | `2`                                                                 | Default VAD aggressiveness (0..3).                                             |
+| `DEFAULT_SYSTEM_PROMPT` | ❌                    | `You are a concise, upbeat assistant…`                              | Default system prompt enforcing short, focused sentences.                       |
+| `DEFAULT_TTS_INSTRUCTIONS` | ❌                | `Speak clearly and positively…`                                     | Default TTS instructions promoting concise speech.                              |
+| `DEFAULT_VAD_AGGR`   | ❌                        | `2`                                                                 | Default webrtcvad aggressiveness (0..3).                                        |
+| `DEFAULT_VAD_START_MS` | ❌                     | `120`                                                               | Minimum voiced audio (ms) before considering speech started.                    |
+| `DEFAULT_VAD_END_MS` | ❌                       | `450`                                                               | Required trailing silence (ms) before cutting a turn.                           |
+| `DEFAULT_VAD_PAD_MS` | ❌                       | `180`                                                               | Additional padding (ms) kept around detected speech.                            |
+| `DEFAULT_VAD_MAX_MS` | ❌                       | `5000`                                                              | Maximum turn length (ms) before force-closing a chunk.                          |
+| `DEFAULT_VAD_AUTORESP` | ❌                     | `1`                                                                 | Auto-trigger a response when VAD commits user speech.                           |
+| `DEFAULT_VAD_INTERRUPT_RESPONSE` | ❌          | `0`                                                                 | Interrupt streaming replies when new speech arrives via server VAD.             |
 | `API_TOKENS`        | ❌                        | –                                                                   | Comma-separated tokens to allow access to realtime endpoint. Empty = no auth.  |
 | `SERVER_NAME`       | ❌                        | `0.0.0.0`                                                           | Bind address for the FastAPI/uvicorn server.                                   |
 | `SERVER_PORT`       | ❌                        | `8080`                                                              | Bind port for the FastAPI/uvicorn server.                                      |
+
+### VAD tuning defaults
+
+Server-side VAD is opt-in (via `session.update`), but the defaults above help keep chunks aligned with spoken sentences. Lower `DEFAULT_VAD_END_MS` and `DEFAULT_VAD_MAX_MS` if you need quicker, more granular commits, or raise them when you prefer longer turns. Boolean toggles such as `DEFAULT_VAD_AUTORESP` accept `1/0`, `true/false`, `yes/no`, or `on/off`. All timings are expressed in milliseconds.
 
 **Audio formats**
 
