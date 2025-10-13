@@ -556,16 +556,16 @@ async def realtime_ws_endpoint(websocket: WebSocket):
             response_done(rid, asst_item_id)
             return
 
-        accum: List[str] = []
-        for i, tok in enumerate(ans.split()):
-            if current_resp['cancelled']:
-                send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}}); break
-            piece = tok if i == 0 else " " + tok
-            accum.append(piece)
-            response_text_delta(rid, asst_item_id, piece)
+        if current_resp['cancelled']:
+            send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
+            response_done(rid, asst_item_id)
+            return
 
-        if not current_resp['cancelled']: response_text_done(rid, asst_item_id, "".join(accum))
-        else: response_done(rid, asst_item_id); return
+        # Align with OpenAI's realtime responses: send a single delta containing the
+        # full text rather than tokenising locally (which caused cumulative repeats
+        # client-side).
+        response_text_delta(rid, asst_item_id, ans)
+        response_text_done(rid, asst_item_id, ans)
 
         voice = st.session.get('voice', 'shimmer')
         tts_instructions = (
