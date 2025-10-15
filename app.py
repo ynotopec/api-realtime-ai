@@ -94,8 +94,9 @@ class Cfg:
     REQUEST_TIMEOUT = _env_int('REQUEST_TIMEOUT', 30, minimum=1)
     DEFAULT_SYSTEM_PROMPT = os.getenv(
         'DEFAULT_SYSTEM_PROMPT',
-        'You are a concise, upbeat assistant. Reply in short, clear sentences '
-        '(15 words maximum per sentence) and stay focused on the user request.',
+        'You are a realtime translator and dialogue partner. Always answer the user\'s '
+        'latest request directly, using short sentences (15 words max) with no meta '
+        'commentary about the conversation, the user, or yourself.',
     )
     DEFAULT_TTS_INSTRUCTIONS = os.getenv(
         'DEFAULT_TTS_INSTRUCTIONS',
