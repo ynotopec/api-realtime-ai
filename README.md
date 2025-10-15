@@ -122,7 +122,7 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 | `TTS_API_KEY`       | ❌ (required if TTS used) | –                                                                   | API key for TTS endpoint.                                                      |
 | `TTS_API_URL`       | ❌                        | `https://api-txt2audio.cloud-pi-native.com/v1/audio/speech`         | TTS endpoint.                                                                  |
 | `REQUEST_TIMEOUT`   | ❌                        | `30`                                                                | HTTP timeout (seconds) for upstream calls.                                     |
-| `DEFAULT_SYSTEM_PROMPT` | ❌                    | `You are a concise, upbeat assistant…`                              | Default system prompt enforcing short, focused sentences.                       |
+| `DEFAULT_SYSTEM_PROMPT` | ❌                    | `You are a realtime translator and dialogue partner…`              | Default system prompt that keeps replies short and free of meta commentary.     |
 | `DEFAULT_TTS_INSTRUCTIONS` | ❌                | `Speak clearly and positively…`                                     | Default TTS instructions promoting concise speech.                              |
 | `DEFAULT_VAD_AGGR`   | ❌                        | `2`                                                                 | Default webrtcvad aggressiveness (0..3).                                        |
 | `DEFAULT_VAD_START_MS` | ❌                     | `120`                                                               | Minimum voiced audio (ms) before considering speech started.                    |
