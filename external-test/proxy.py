@@ -15,8 +15,7 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
 # Use environment variable for API key
-OPENAI_API_KEY = 'sk-OX_zYocmpagMGfLyJhig6g'
-#os.environ.get("OPENAI_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logging.warning("OPENAI_API_KEY not set. Please export OPENAI_API_KEY environment variable.")
 
