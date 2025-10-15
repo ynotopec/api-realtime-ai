@@ -19,8 +19,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logging.warning("OPENAI_API_KEY not set. Please export OPENAI_API_KEY environment variable.")
 
-OPENAI_API_BASE = 'https://api-realtime-ai.cloud-pi-native.com/v1'
-#os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
