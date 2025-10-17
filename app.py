@@ -83,13 +83,13 @@ def _summarize_payload(payload: Any, *, limit: int = 200) -> str:
 
 
 class Cfg:
-    AUDIO_API_KEY = os.getenv('AUDIO_API_KEY')
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-    OPENAI_API_BASE = os.getenv('OPENAI_API_BASE', '')
+    OPENAI_API_BASE = os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1')
     OPENAI_MODEL = os.getenv('OPENAI_API_MODEL', 'gemma3n')
 #gpt-oss')
-    WHISPER_URL = os.getenv('WHISPER_URL', 'https://api-audio2txt.cloud-pi-native.com/v1/audio/transcriptions')
-    TTS_API_KEY = os.getenv('TTS_API_KEY')
+    STT_API_BASE = os.getenv('STT_API_BASE') or os.getenv('WHISPER_URL') or 'https://api.openai.com/v1'
+    STT_API_KEY = os.getenv('STT_API_KEY') or OPENAI_API_KEY
+    TTS_API_KEY = os.getenv('TTS_API_KEY') or os.getenv('AUDIO_API_KEY') or OPENAI_API_KEY
     TTS_URL = os.getenv('TTS_API_URL', 'https://api-txt2audio.cloud-pi-native.com/v1/audio/speech')
     REQUEST_TIMEOUT = _env_int('REQUEST_TIMEOUT', 30, minimum=1)
     DEFAULT_SYSTEM_PROMPT = os.getenv(
@@ -112,13 +112,8 @@ class Cfg:
     DEFAULT_VAD_INTERRUPT_RESPONSE = _coerce_bool(os.getenv('DEFAULT_VAD_INTERRUPT_RESPONSE'), False)
 
 
-for var_name in ("AUDIO_API_KEY", "OPENAI_API_KEY"):
-    if not getattr(Cfg, var_name):
-        raise RuntimeError(f"Missing mandatory env variable : {var_name}")
-
-# Default OpenAI API base if not provided
-if not Cfg.OPENAI_API_BASE:
-    Cfg.OPENAI_API_BASE = 'https://api.openai.com/v1'
+if not Cfg.OPENAI_API_KEY:
+    raise RuntimeError("Missing mandatory env variable : OPENAI_API_KEY")
 
 session = requests.Session()
 session.mount(
@@ -190,9 +185,10 @@ def call_whisper(file) -> Dict[str, Any]:
         'file': (file.filename, file.stream, 'audio/webm'),
         'model': (None, 'whisper-1'),
     }
+    stt_url = f"{Cfg.STT_API_BASE.rstrip('/')}/audio/transcriptions"
     return post(
-        Cfg.WHISPER_URL,
-        headers={'Authorization': f'Bearer {Cfg.AUDIO_API_KEY}'},
+        stt_url,
+        headers={'Authorization': f'Bearer {Cfg.STT_API_KEY}'},
         files=files
     ).json()
 
