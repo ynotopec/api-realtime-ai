@@ -88,11 +88,12 @@ websockets
 Create a `.env` file or export the environment variables described in [Configuration](#configuration). A minimal setup looks like:
 
 ```bash
-export AUDIO_API_KEY=...          # Whisper backend
-export OPENAI_API_KEY=...         # LLM for conversation replies
+export OPENAI_API_KEY=...         # Shared API key for OpenAI-compatible services
+export STT_API_KEY=...            # Optional override for transcription endpoint
+export TTS_API_KEY=...            # Optional override for TTS endpoint
 export OPENAI_API_BASE=https://your-openai-compatible-host
+export STT_API_BASE=https://api.openai.com/v1
 export OPENAI_API_MODEL=gpt-oss
-export TTS_API_KEY=...
 export TTS_API_URL=https://api-txt2audio.cloud-pi-native.com/v1/audio/speech
 export API_TOKENS="token1,token2" # optional auth for realtime WebSocket
 export SERVER_NAME=0.0.0.0        # optional host binding
@@ -114,12 +115,12 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 
 | Variable            | Required                 | Default                                                             | Description                                                                    |
 | ------------------- | ------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `AUDIO_API_KEY`     | ✅                        | –                                                                   | API key for Whisper transcription backend.                                     |
 | `OPENAI_API_KEY`    | ✅                        | –                                                                   | API key for OpenAI-compatible chat endpoint (conversation replies).            |
-| `OPENAI_API_BASE`   | ✅ (if not default)       | ``                                                                  | Base URL for OpenAI-compatible API (must expose `/chat/completions`).          |
+| `OPENAI_API_BASE`   | ✅ (if not default)       | `https://api.openai.com/v1`                                         | Base URL for OpenAI-compatible API (must expose `/chat/completions`).          |
 | `OPENAI_API_MODEL`  | ❌                        | `gpt-oss`                                                           | Model name for conversation replies.                                           |
-| `WHISPER_URL`       | ❌                        | `https://api-audio2txt.cloud-pi-native.com/v1/audio/transcriptions` | Whisper transcription endpoint.                                                |
-| `TTS_API_KEY`       | ❌ (required if TTS used) | –                                                                   | API key for TTS endpoint.                                                      |
+| `STT_API_BASE`      | ❌                        | `https://api.openai.com/v1`                                         | Base URL for STT endpoint (app appends `/audio/transcriptions`).               |
+| `STT_API_KEY`       | ❌                        | `OPENAI_API_KEY`                                                    | API key for STT endpoint. Defaults to `OPENAI_API_KEY`.                         |
+| `TTS_API_KEY`       | ❌                        | `OPENAI_API_KEY`                                                    | API key for TTS endpoint. Defaults to `OPENAI_API_KEY`.                         |
 | `TTS_API_URL`       | ❌                        | `https://api-txt2audio.cloud-pi-native.com/v1/audio/speech`         | TTS endpoint.                                                                  |
 | `REQUEST_TIMEOUT`   | ❌                        | `30`                                                                | HTTP timeout (seconds) for upstream calls.                                     |
 | `DEFAULT_SYSTEM_PROMPT` | ❌                    | `You are a realtime translator and dialogue partner…`              | Default system prompt that keeps replies short and free of meta commentary.     |
@@ -243,7 +244,7 @@ asyncio.run(main())
 ## Troubleshooting
 
 * **No audio output**: verify TTS credentials and upstream service health.
-* **Whisper errors**: check `AUDIO_API_KEY`, `WHISPER_URL`, and upstream service health.
+* **Whisper errors**: check `TTS_API_KEY`, `STT_API_BASE`, and upstream service health.
 * **`ffmpeg` not found**: install it and ensure it’s on `$PATH` inside your runtime.
 * **High latency**: tune VAD (`start_ms`, `end_ms`, `pad_ms`, `max_ms`) and reduce TTS chunk size.
 * **WebSocket closes immediately**: missing/invalid token with `API_TOKENS` set.
