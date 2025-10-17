@@ -1,15 +1,11 @@
 import os
 import json
 import asyncio
-import base64
 import logging
-from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 from openai import AsyncOpenAI  # same client you were using
-
-SAMPLE_RATE = 24000
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
