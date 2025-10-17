@@ -18,8 +18,34 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 
 # ────────────────────────────── Config & logging ──────────────────────────────
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s – %(message)s')
+
+
+def _resolve_log_level(default: str = 'WARNING') -> int:
+    """Return an integer log level derived from the LOG_LEVEL env var."""
+
+    raw = (os.getenv('LOG_LEVEL') or default).strip()
+    if not raw:
+        raw = default
+    raw_upper = raw.upper()
+    if raw_upper.isdigit():
+        try:
+            value = int(raw_upper)
+        except ValueError:
+            value = None
+        else:
+            if value >= 0:
+                return value
+    value = getattr(logging, raw_upper, None)
+    if isinstance(value, int):
+        return value
+    fallback = getattr(logging, default.upper(), logging.INFO)
+    return fallback if isinstance(fallback, int) else logging.INFO
+
+
+_LOG_LEVEL = _resolve_log_level()
+logging.basicConfig(level=_LOG_LEVEL, format='[%(levelname)s] %(asctime)s – %(message)s')
 logger = logging.getLogger(__name__)
+logger.setLevel(_LOG_LEVEL)
 
 
 def log(message: str, *args: Any, **kwargs: Any) -> None:
@@ -90,7 +116,13 @@ class Cfg:
     STT_API_BASE = os.getenv('STT_API_BASE') or os.getenv('WHISPER_URL') or 'https://api.openai.com/v1'
     STT_API_KEY = os.getenv('STT_API_KEY') or OPENAI_API_KEY
     TTS_API_KEY = os.getenv('TTS_API_KEY') or os.getenv('AUDIO_API_KEY') or OPENAI_API_KEY
-    TTS_API_BASE = os.getenv('TTS_API_BASE') or os.getenv('TTS_API_URL') or OPENAI_API_BASE
+    _TTS_API_RAW = os.getenv('TTS_API_BASE') or os.getenv('TTS_API_URL') or OPENAI_API_BASE
+    TTS_API_BASE = _TTS_API_RAW
+    _TTS_API_CLEAN = (_TTS_API_RAW or '').rstrip('/')
+    if _TTS_API_CLEAN.endswith('/audio/speech'):
+        TTS_SPEECH_URL = _TTS_API_CLEAN
+    else:
+        TTS_SPEECH_URL = f"{_TTS_API_CLEAN}/audio/speech" if _TTS_API_CLEAN else '/audio/speech'
     REQUEST_TIMEOUT = _env_int('REQUEST_TIMEOUT', 30, minimum=1)
     DEFAULT_SYSTEM_PROMPT = os.getenv(
         'DEFAULT_SYSTEM_PROMPT',
@@ -210,7 +242,7 @@ def _iter_tts_pcm16le(
         'instructions': instructions,
         'response_format': {'type': 'pcm16', 'sample_rate': 16000},
     }
-    tts_url = f"{Cfg.TTS_API_BASE.rstrip('/')}/audio/speech"
+    tts_url = Cfg.TTS_SPEECH_URL or '/audio/speech'
     headers = {
         'Authorization': f'Bearer {Cfg.TTS_API_KEY}',
         'Content-Type': 'application/json',
