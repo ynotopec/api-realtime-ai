@@ -260,8 +260,12 @@ def _resample_pcm_ffmpeg(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
 
 
 def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
+    """Persist a PCM24k buffer to disk and transcode it to WebM via ffmpeg."""
     f_pcm = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
     f_webm = tempfile.NamedTemporaryFile(suffix='.webm', delete=False)
+    pcm_path = f_pcm.name
+    webm_path = f_webm.name
+    success = False
     try:
         f_pcm.write(pcm)
         f_pcm.flush()
@@ -269,22 +273,32 @@ def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
             [
                 'ffmpeg', '-y',
                 '-f', 's16le', '-ar', str(REALTIME_SR), '-ac', '1',
-                '-i', f_pcm.name,
+                '-i', pcm_path,
                 '-c:a', 'libopus', '-b:a', '32k',
-                f_webm.name
+                webm_path
             ],
             stderr=subprocess.DEVNULL
         )
-        return f_webm.name
+        success = True
+        return webm_path
     finally:
         try:
             f_pcm.close()
         except Exception:
             pass
         try:
+            os.unlink(pcm_path)
+        except OSError:
+            pass
+        try:
             f_webm.close()
         except Exception:
             pass
+        if not success:
+            try:
+                os.unlink(webm_path)
+            except OSError:
+                pass
 
 
 # ────────────────────────────── FastAPI App ──────────────────────────────
