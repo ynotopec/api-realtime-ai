@@ -1,6 +1,7 @@
 # /home/ailab/api-realtime-ai/app.py
 import asyncio
 import base64
+import binascii
 import io
 import json
 import logging
@@ -226,6 +227,46 @@ def call_whisper(
     ).json()
 
 
+def _decode_first_base64(obj: Any) -> Optional[bytes]:
+    """Try to locate and decode the first base64 payload within a JSON response."""
+
+    if isinstance(obj, dict):
+        # Prefer common audio-specific keys first to avoid traversing unrelated data.
+        preferred_keys = [
+            'audio',
+            'pcm',
+            'pcm16',
+            'b64_json',
+            'data',
+            'value',
+            'blob',
+        ]
+        for key in preferred_keys:
+            if key in obj:
+                decoded = _decode_first_base64(obj[key])
+                if decoded is not None:
+                    return decoded
+        for value in obj.values():
+            decoded = _decode_first_base64(value)
+            if decoded is not None:
+                return decoded
+    elif isinstance(obj, list):
+        for item in obj:
+            decoded = _decode_first_base64(item)
+            if decoded is not None:
+                return decoded
+    elif isinstance(obj, str):
+        data = obj.strip()
+        if not data:
+            return None
+        try:
+            # ``validate=True`` rejects strings that contain non-base64 characters.
+            return base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+    return None
+
+
 def _iter_tts_pcm16le(
     text: str,
     voice: str,
@@ -235,7 +276,7 @@ def _iter_tts_pcm16le(
 ) -> Iterable[bytes]:
     """Stream 16 kHz PCM audio from the TTS backend without touching disk."""
 
-    payload = {
+    request_payload = {
         'model': 'gpt-4o-mini-tts',
         'input': text,
         'voice': voice,
@@ -248,11 +289,15 @@ def _iter_tts_pcm16le(
         'Content-Type': 'application/json',
     }
     chunk_bytes = max(1, int(chunk_samples) * BYTES_PER_SAMPLE)
-    log("[IO][HTTP][OUTBOUND] POST(stream) %s payload=%s", tts_url, _summarize_payload({'json': payload}))
+    log(
+        "[IO][HTTP][OUTBOUND] POST(stream) %s payload=%s",
+        tts_url,
+        _summarize_payload({'json': request_payload}),
+    )
     with session.post(
         tts_url,
         headers=headers,
-        json=payload,
+        json=request_payload,
         stream=True,
         timeout=Cfg.REQUEST_TIMEOUT,
     ) as response:
@@ -263,6 +308,20 @@ def _iter_tts_pcm16le(
             True,
         )
         response.raise_for_status()
+        content_type = (response.headers.get('content-type') or '').lower()
+        if 'application/json' in content_type or content_type.startswith('text/'):
+            try:
+                json_payload = response.json()
+            except Exception as exc:
+                raise RuntimeError(f'Unexpected non-binary TTS payload (failed to parse JSON): {exc}') from exc
+            decoded = _decode_first_base64(json_payload)
+            if not decoded:
+                raise RuntimeError('TTS JSON response missing audio payload')
+            for i in range(0, len(decoded), chunk_bytes):
+                chunk = decoded[i : i + chunk_bytes]
+                if chunk:
+                    yield chunk
+            return
         buffer = bytearray()
         for chunk in response.iter_content(chunk_size=chunk_bytes):
             if not chunk:
