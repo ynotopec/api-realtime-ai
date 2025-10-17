@@ -1,13 +1,13 @@
 # /home/ailab/api-realtime-ai/app.py
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
-import subprocess
-import tempfile
 import threading
 import uuid
+import wave
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 
@@ -175,14 +175,15 @@ _RESAMPLE_I1_24_TO_16 = np.minimum(_RESAMPLE_I0_24_TO_16 + 1, SMP_24K - 1)
 _RESAMPLE_FRAC_24_TO_16 = _RESAMPLE_POS_24_TO_16 - _RESAMPLE_I0_24_TO_16
 
 
-def call_whisper(file) -> Dict[str, Any]:
-    """Send the uploaded audio blob to the Whisper transcription backend."""
-    # Some endpoints expect the "model" field to be part of the multipart form-data
-    # rather than the request body. Align with the historically working payload
-    # structure to maximise compatibility with both the legacy and current
-    # backends.
+def call_whisper(
+    file_bytes: bytes,
+    *,
+    filename: str = 'audio.wav',
+    content_type: str = 'audio/wav',
+) -> Dict[str, Any]:
+    """Send the provided audio blob to the Whisper transcription backend."""
     files = {
-        'file': (file.filename, file.stream, 'audio/webm'),
+        'file': (filename, file_bytes, content_type),
         'model': (None, 'whisper-1'),
     }
     stt_url = f"{Cfg.STT_API_BASE.rstrip('/')}/audio/transcriptions"
@@ -193,33 +194,58 @@ def call_whisper(file) -> Dict[str, Any]:
     ).json()
 
 
-def call_tts_webm(text: str, voice: str, instructions: str) -> bytes:
+def _iter_tts_pcm16le(
+    text: str,
+    voice: str,
+    instructions: str,
+    *,
+    chunk_samples: int = SMP_16K,
+) -> Iterable[bytes]:
+    """Stream 16 kHz PCM audio from the TTS backend without touching disk."""
+
     payload = {
         'model': 'gpt-4o-mini-tts',
         'input': text,
         'voice': voice,
         'instructions': instructions,
-        'response_format': 'opus'
+        'response_format': {'type': 'pcm16', 'sample_rate': 16000},
     }
     tts_url = f"{Cfg.TTS_API_BASE.rstrip('/')}/audio/speech"
-    return post(
+    headers = {
+        'Authorization': f'Bearer {Cfg.TTS_API_KEY}',
+        'Content-Type': 'application/json',
+    }
+    chunk_bytes = max(1, int(chunk_samples) * BYTES_PER_SAMPLE)
+    log("[IO][HTTP][OUTBOUND] POST(stream) %s payload=%s", tts_url, _summarize_payload({'json': payload}))
+    with session.post(
         tts_url,
-        headers={'Authorization': f'Bearer {Cfg.TTS_API_KEY}', 'Content-Type': 'application/json'},
-        json=payload
-    ).content
+        headers=headers,
+        json=payload,
+        stream=True,
+        timeout=Cfg.REQUEST_TIMEOUT,
+    ) as response:
+        log(
+            "[IO][HTTP][OUTBOUND][RESPONSE] url=%s status=%s streaming=%s",
+            tts_url,
+            response.status_code,
+            True,
+        )
+        response.raise_for_status()
+        buffer = bytearray()
+        for chunk in response.iter_content(chunk_size=chunk_bytes):
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            while len(buffer) >= chunk_bytes:
+                out = bytes(buffer[:chunk_bytes])
+                del buffer[:chunk_bytes]
+                yield out
+        if buffer:
+            yield bytes(buffer)
 
 
 def call_tts_pcm16le(text: str, voice: str, instructions: str) -> bytes:
-    webm = call_tts_webm(text, voice, instructions)
-    with tempfile.NamedTemporaryFile(suffix='.webm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
-        fi.write(webm)
-        fi.flush()
-        subprocess.check_output(
-            ['ffmpeg', '-y', '-i', fi.name, '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', fo.name],
-            stderr=subprocess.DEVNULL
-        )
-        fo.seek(0)
-        return fo.read()
+    return b"".join(_iter_tts_pcm16le(text, voice, instructions))
 
 
 def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
@@ -246,59 +272,43 @@ def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
     return np.clip(out, -32768.0, 32767.0).astype(np.int16, copy=False).tobytes()
 
 
-def _resample_pcm_ffmpeg(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix='.pcm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
-        fi.write(pcm)
-        fi.flush()
-        subprocess.check_output(
-            ['ffmpeg', '-y', '-f', 's16le', '-ar', str(sr_in), '-ac', '1', '-i', fi.name,
-             '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', str(sr_out), '-ac', '1', fo.name],
-            stderr=subprocess.DEVNULL
-        )
-        fo.seek(0)
-        return fo.read()
+def _resample_linear(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
+    if not pcm:
+        return b""
+    if sr_in == sr_out:
+        return pcm
+    src = np.frombuffer(pcm, dtype=np.int16)
+    if not src.size:
+        return b""
+    target_samples = int(round(src.size * float(sr_out) / float(sr_in)))
+    if target_samples <= 1:
+        return pcm
+    limit = max(src.size - 1, 1)
+    pos = np.linspace(0.0, limit, target_samples, dtype=np.float32)
+    i0 = np.floor(pos).astype(np.int32)
+    i1 = np.minimum(i0 + 1, src.size - 1)
+    frac = pos - i0
+    src_f = src.astype(np.float32)
+    base = src_f[i0]
+    diff = src_f[i1] - base
+    out = base + diff * frac
+    return np.clip(out, -32768.0, 32767.0).astype(np.int16, copy=False).tobytes()
 
 
-def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
-    """Persist a PCM24k buffer to disk and transcode it to WebM via ffmpeg."""
-    f_pcm = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
-    f_webm = tempfile.NamedTemporaryFile(suffix='.webm', delete=False)
-    pcm_path = f_pcm.name
-    webm_path = f_webm.name
-    success = False
-    try:
-        f_pcm.write(pcm)
-        f_pcm.flush()
-        subprocess.check_output(
-            [
-                'ffmpeg', '-y',
-                '-f', 's16le', '-ar', str(REALTIME_SR), '-ac', '1',
-                '-i', pcm_path,
-                '-c:a', 'libopus', '-b:a', '32k',
-                webm_path
-            ],
-            stderr=subprocess.DEVNULL
-        )
-        success = True
-        return webm_path
-    finally:
-        try:
-            f_pcm.close()
-        except Exception:
-            pass
-        try:
-            os.unlink(pcm_path)
-        except OSError:
-            pass
-        try:
-            f_webm.close()
-        except Exception:
-            pass
-        if not success:
-            try:
-                os.unlink(webm_path)
-            except OSError:
-                pass
+def _resample_16k_to_24k_linear(pcm16: bytes) -> bytes:
+    return _resample_linear(pcm16, 16000, REALTIME_SR)
+
+
+def _pcm_to_wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
+    if not pcm:
+        return b""
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(BYTES_PER_SAMPLE)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    return buffer.getvalue()
 
 
 # ────────────────────────────── FastAPI App ──────────────────────────────
@@ -442,17 +452,8 @@ async def _send_ws_json_async(
 
 
 def _transcribe_24k_pcm(pcm24: bytes) -> str:
-    path = _pcm24k_to_webm_for_whisper(pcm24)
-    class DF:
-        filename = 'audio.webm'
-    df = DF()
-    df.stream = open(path, 'rb')
-    df.content_length = os.path.getsize(path)
-    try:
-        return (call_whisper(df) or {}).get('text', '').strip()
-    finally:
-        df.stream.close()
-        os.unlink(path)
+    wav = _pcm_to_wav_bytes(pcm24, REALTIME_SR)
+    return (call_whisper(wav, filename='audio.wav', content_type='audio/wav') or {}).get('text', '').strip()
 
 
 def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
@@ -596,15 +597,33 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         )
         try:
             if not current_resp['cancelled']:
-                pcm16 = call_tts_pcm16le(ans, voice, tts_instructions)
-                pcm24 = _resample_pcm_ffmpeg(pcm16, 16000, REALTIME_SR)
-                hop = int(REALTIME_SR * 0.2) * 2
-                for i in range(0, len(pcm24), hop):
+                hop = int(REALTIME_SR * 0.2) * BYTES_PER_SAMPLE
+                pcm24_buffer = bytearray()
+                cancel_notified = False
+                for pcm16_chunk in _iter_tts_pcm16le(ans, voice, tts_instructions):
                     if current_resp['cancelled']:
-                        send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}}); break
-                    response_audio_delta(rid, asst_item_id, _b64(pcm24[i:i + hop]))
-                if not current_resp['cancelled']: response_audio_done(rid, asst_item_id)
-        except Exception as e: send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
+                        if not cancel_notified:
+                            send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
+                            cancel_notified = True
+                        break
+                    pcm24_buffer.extend(_resample_16k_to_24k_linear(pcm16_chunk))
+                    while len(pcm24_buffer) >= hop:
+                        if current_resp['cancelled']:
+                            if not cancel_notified:
+                                send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
+                                cancel_notified = True
+                            break
+                        chunk = bytes(pcm24_buffer[:hop])
+                        del pcm24_buffer[:hop]
+                        response_audio_delta(rid, asst_item_id, _b64(chunk))
+                    if cancel_notified:
+                        break
+                if not current_resp['cancelled'] and pcm24_buffer:
+                    response_audio_delta(rid, asst_item_id, _b64(bytes(pcm24_buffer)))
+                if not current_resp['cancelled'] and not cancel_notified:
+                    response_audio_done(rid, asst_item_id)
+        except Exception as e:
+            send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
 
         response_done(rid, asst_item_id)
         st.add({'id': asst_item_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': ans}]})
