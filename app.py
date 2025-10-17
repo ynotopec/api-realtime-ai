@@ -90,7 +90,7 @@ class Cfg:
     STT_API_BASE = os.getenv('STT_API_BASE') or os.getenv('WHISPER_URL') or 'https://api.openai.com/v1'
     STT_API_KEY = os.getenv('STT_API_KEY') or OPENAI_API_KEY
     TTS_API_KEY = os.getenv('TTS_API_KEY') or os.getenv('AUDIO_API_KEY') or OPENAI_API_KEY
-    TTS_URL = os.getenv('TTS_API_URL', 'https://api-txt2audio.cloud-pi-native.com/v1/audio/speech')
+    TTS_API_BASE = os.getenv('TTS_API_BASE') or os.getenv('TTS_API_URL') or OPENAI_API_BASE
     REQUEST_TIMEOUT = _env_int('REQUEST_TIMEOUT', 30, minimum=1)
     DEFAULT_SYSTEM_PROMPT = os.getenv(
         'DEFAULT_SYSTEM_PROMPT',
@@ -201,8 +201,9 @@ def call_tts_webm(text: str, voice: str, instructions: str) -> bytes:
         'instructions': instructions,
         'response_format': 'opus'
     }
+    tts_url = f"{Cfg.TTS_API_BASE.rstrip('/')}/audio/speech"
     return post(
-        Cfg.TTS_URL,
+        tts_url,
         headers={'Authorization': f'Bearer {Cfg.TTS_API_KEY}', 'Content-Type': 'application/json'},
         json=payload
     ).content
