@@ -547,7 +547,23 @@ def _transcribe_24k_pcm(pcm24: bytes) -> str:
     return (call_whisper(wav, filename='audio.wav', content_type='audio/wav') or {}).get('text', '').strip()
 
 
-def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
+def _normalize_conversation_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(item)
+    if (normalized.get('type') == 'message' and
+            normalized.get('role') in ('user', 'system', 'assistant')):
+        content = []
+        for part in normalized.get('content') or []:
+            p_type = (part.get('type') or '').lower()
+            if p_type in {'input_text', 'text', 'output_text'}:
+                content.append({'type': 'input_text', 'text': part.get('text', '')})
+            else:
+                content.append(part)
+        normalized['content'] = content
+    normalized.setdefault('id', _nid('item'))
+    return normalized
+
+
+def _messages_from_items(st: WSConv, extra_system_prompt: Optional[str] = None) -> List[Dict[str, Any]]:
     msgs: List[Dict[str, Any]] = []
     system_prompts: List[str] = []
     if Cfg.DEFAULT_SYSTEM_PROMPT:
@@ -555,6 +571,8 @@ def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
     instr = st.session.get('instructions')
     if instr:
         system_prompts.append(instr)
+    if extra_system_prompt:
+        system_prompts.append(extra_system_prompt)
     if system_prompts:
         msgs.append({'role': 'system', 'content': '\n\n'.join(system_prompts)})
 
@@ -570,9 +588,13 @@ def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
     return msgs
 
 
-def _llm_reply_from_history(st: WSConv) -> str:
+def _llm_reply_from_history(st: WSConv, extra_system_prompt: Optional[str] = None) -> str:
     try:
-        data = {'model': Cfg.OPENAI_MODEL, 'messages': _messages_from_items(st), 'temperature': 0.3}
+        data = {
+            'model': Cfg.OPENAI_MODEL,
+            'messages': _messages_from_items(st, extra_system_prompt=extra_system_prompt),
+            'temperature': 0.3,
+        }
         r = post(f"{Cfg.OPENAI_API_BASE}/chat/completions",
                  headers={'Authorization': f'Bearer {Cfg.OPENAI_API_KEY}'}, json=data).json()
         return (r['choices'][0]['message']['content'] or '').strip()
@@ -621,7 +643,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
     session_payload = _session_payload(sess_id, st.session)
     await send_async({'type': 'session.created', 'session': session_payload})
 
-    current_resp = {'id': None, 'cancelled': False}
+    current_resp = {'id': None, 'cancelled': False, 'override_instructions': None, 'modalities': None}
 
     vad_state = {
         'vad': webrtcvad.Vad(Cfg.DEFAULT_VAD_AGGR),
@@ -638,10 +660,21 @@ async def realtime_ws_endpoint(websocket: WebSocket):
 
     # Core response generator (runs in a thread)
     def _handle_response_create():
-        messages = _messages_from_items(st)
+        override_instructions = current_resp.get('override_instructions')
+        requested_modalities = current_resp.get('modalities')
+        if requested_modalities:
+            modalities = {str(m).lower() for m in requested_modalities if isinstance(m, str)}
+        else:
+            modalities = set()
+        wants_text = not modalities or 'text' in modalities
+        wants_audio = not modalities or 'audio' in modalities
+
+        messages = _messages_from_items(st, extra_system_prompt=override_instructions)
         if not messages or messages[-1].get('role') != 'user':
             log("[REALTIME][WS][RESP] skipped response.create → no user message available")
             send_from_thread(openai_error('no user message to respond to', 'client_error', None, 400))
+            current_resp['override_instructions'] = None
+            current_resp['modalities'] = None
             return
 
         def resp_created(rid): send_from_thread({'type': 'response.created', 'response': {'id': rid}})
@@ -663,62 +696,70 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         current_resp['id'] = rid
         current_resp['cancelled'] = False
 
-        try: ans = _llm_reply_from_history(st)
+        try: ans = _llm_reply_from_history(st, extra_system_prompt=override_instructions)
         except Exception as e:
             send_from_thread(openai_error(f'llm failed: {e}', 'internal_error', None, 500))
             response_done(rid, asst_item_id)
+            current_resp['override_instructions'] = None
+            current_resp['modalities'] = None
             return
 
         if current_resp['cancelled']:
             send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
             response_done(rid, asst_item_id)
+            current_resp['override_instructions'] = None
+            current_resp['modalities'] = None
             return
 
         # Align with OpenAI's realtime responses: send a single delta containing the
         # full text rather than tokenising locally (which caused cumulative repeats
         # client-side).
-        response_text_delta(rid, asst_item_id, ans)
-        response_text_done(rid, asst_item_id, ans)
+        if wants_text:
+            response_text_delta(rid, asst_item_id, ans)
+            response_text_done(rid, asst_item_id, ans)
 
-        voice = st.session.get('voice', 'shimmer')
-        tts_instructions = (
-            st.session.get('tts_instructions')
-            or st.session.get('instructions')
-            or Cfg.DEFAULT_TTS_INSTRUCTIONS
-        )
-        try:
-            if not current_resp['cancelled']:
-                hop = int(REALTIME_SR * 0.2) * BYTES_PER_SAMPLE
-                pcm24_buffer = bytearray()
-                cancel_notified = False
-                for pcm16_chunk in _iter_tts_pcm16le(ans, voice, tts_instructions):
-                    if current_resp['cancelled']:
-                        if not cancel_notified:
-                            send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
-                            cancel_notified = True
-                        break
-                    pcm24_buffer.extend(_resample_16k_to_24k_linear(pcm16_chunk))
-                    while len(pcm24_buffer) >= hop:
+        if wants_audio:
+            voice = st.session.get('voice', 'shimmer')
+            tts_instructions = (
+                st.session.get('tts_instructions')
+                or st.session.get('instructions')
+                or Cfg.DEFAULT_TTS_INSTRUCTIONS
+            )
+            try:
+                if not current_resp['cancelled']:
+                    hop = int(REALTIME_SR * 0.2) * BYTES_PER_SAMPLE
+                    pcm24_buffer = bytearray()
+                    cancel_notified = False
+                    for pcm16_chunk in _iter_tts_pcm16le(ans, voice, tts_instructions):
                         if current_resp['cancelled']:
                             if not cancel_notified:
                                 send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
                                 cancel_notified = True
                             break
-                        chunk = bytes(pcm24_buffer[:hop])
-                        del pcm24_buffer[:hop]
-                        response_audio_delta(rid, asst_item_id, _b64(chunk))
-                    if cancel_notified:
-                        break
-                if not current_resp['cancelled'] and pcm24_buffer:
-                    response_audio_delta(rid, asst_item_id, _b64(bytes(pcm24_buffer)))
-                if not current_resp['cancelled'] and not cancel_notified:
-                    response_audio_done(rid, asst_item_id)
-        except Exception as e:
-            send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
+                        pcm24_buffer.extend(_resample_16k_to_24k_linear(pcm16_chunk))
+                        while len(pcm24_buffer) >= hop:
+                            if current_resp['cancelled']:
+                                if not cancel_notified:
+                                    send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
+                                    cancel_notified = True
+                                break
+                            chunk = bytes(pcm24_buffer[:hop])
+                            del pcm24_buffer[:hop]
+                            response_audio_delta(rid, asst_item_id, _b64(chunk))
+                        if cancel_notified:
+                            break
+                    if not current_resp['cancelled'] and pcm24_buffer:
+                        response_audio_delta(rid, asst_item_id, _b64(bytes(pcm24_buffer)))
+                    if not current_resp['cancelled'] and not cancel_notified:
+                        response_audio_done(rid, asst_item_id)
+            except Exception as e:
+                send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
 
         response_done(rid, asst_item_id)
         st.add({'id': asst_item_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': ans}]})
         _prune_history(st)
+        current_resp['override_instructions'] = None
+        current_resp['modalities'] = None
 
     def _start_response_thread():
         t = threading.Thread(target=_handle_response_create, daemon=True)
@@ -879,11 +920,8 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                     log("[REALTIME][WS][COMMIT] auto_create_response → response.create()")
                     _start_response_thread()
             elif t == 'conversation.item.create':
-                it = d.get('item') or {}
-                if it.get('type') == 'message' and it.get('role') in ('user', 'system'):
-                    norm = [{"type": "input_text", "text": p.get('text', '')} if p.get('type') in ('input_text', 'text') else p for p in it.get('content', [])]
-                    it['content'] = norm
-                it.setdefault('id', _nid('item')); st.add(it); _prune_history(st)
+                it = _normalize_conversation_item(d.get('item') or {})
+                st.add(it); _prune_history(st)
                 await send_async({'type': 'conversation.item.created', 'item': it})
             elif t == 'conversation.item.retrieve':
                 item_id = d.get('item_id')
@@ -893,6 +931,23 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 ok = st.delete(item_id)
                 await send_async({'type': 'conversation.item.deleted', 'item_id': item_id, 'deleted': ok})
             elif t == 'response.create':
+                resp_payload = d.get('response') or {}
+                inline_items = resp_payload.get('input')
+                if isinstance(inline_items, list):
+                    for entry in inline_items:
+                        if (entry or {}).get('type') == 'message':
+                            msg_item = _normalize_conversation_item(entry)
+                            st.add(msg_item)
+                            _prune_history(st)
+                            await send_async({'type': 'conversation.item.created', 'item': msg_item})
+                if 'instructions' in resp_payload:
+                    current_resp['override_instructions'] = resp_payload.get('instructions')
+                else:
+                    current_resp['override_instructions'] = None
+                if 'modalities' in resp_payload:
+                    current_resp['modalities'] = resp_payload.get('modalities')
+                else:
+                    current_resp['modalities'] = None
                 _start_response_thread()
             elif t == 'response.cancel':
                 rid = d.get('response', {}).get('id') or d.get('response_id')
