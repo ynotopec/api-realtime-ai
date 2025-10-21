@@ -276,6 +276,11 @@ def _iter_tts_pcm16le(
 ) -> Iterable[bytes]:
     """Stream 16 kHz PCM audio from the TTS backend without touching disk."""
 
+    log(
+        "[REALTIME][WS][TTS] synthesis_start voice=%s text_chars=%s",
+        voice,
+        len(text or ""),
+    )
     request_payload = {
         'model': 'gpt-4o-mini-tts',
         'input': text,
@@ -289,6 +294,7 @@ def _iter_tts_pcm16le(
         'Content-Type': 'application/json',
     }
     chunk_bytes = max(1, int(chunk_samples) * BYTES_PER_SAMPLE)
+    total_bytes = 0
     log(
         "[IO][HTTP][OUTBOUND] POST(stream) %s payload=%s",
         tts_url,
@@ -320,7 +326,9 @@ def _iter_tts_pcm16le(
             for i in range(0, len(decoded), chunk_bytes):
                 chunk = decoded[i : i + chunk_bytes]
                 if chunk:
+                    total_bytes += len(chunk)
                     yield chunk
+            log("[REALTIME][WS][TTS] synthesis_done bytes=%s", total_bytes)
             return
         buffer = bytearray()
         for chunk in response.iter_content(chunk_size=chunk_bytes):
@@ -330,9 +338,12 @@ def _iter_tts_pcm16le(
             while len(buffer) >= chunk_bytes:
                 out = bytes(buffer[:chunk_bytes])
                 del buffer[:chunk_bytes]
+                total_bytes += len(out)
                 yield out
         if buffer:
+            total_bytes += len(buffer)
             yield bytes(buffer)
+    log("[REALTIME][WS][TTS] synthesis_done bytes=%s", total_bytes)
 
 
 def call_tts_pcm16le(text: str, voice: str, instructions: str) -> bytes:
@@ -543,8 +554,11 @@ async def _send_ws_json_async(
 
 
 def _transcribe_24k_pcm(pcm24: bytes) -> str:
+    log("[REALTIME][WS][STT] transcription_start bytes=%s", len(pcm24))
     wav = _pcm_to_wav_bytes(pcm24, REALTIME_SR)
-    return (call_whisper(wav, filename='audio.wav', content_type='audio/wav') or {}).get('text', '').strip()
+    result = (call_whisper(wav, filename='audio.wav', content_type='audio/wav') or {}).get('text', '').strip()
+    log("[REALTIME][WS][STT] transcription_done chars=%s", len(result))
+    return result
 
 
 def _normalize_conversation_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -595,9 +609,16 @@ def _llm_reply_from_history(st: WSConv, extra_system_prompt: Optional[str] = Non
             'messages': _messages_from_items(st, extra_system_prompt=extra_system_prompt),
             'temperature': 0.3,
         }
+        log(
+            "[REALTIME][WS][LLM] request model=%s messages=%s",
+            Cfg.OPENAI_MODEL,
+            len(data['messages']),
+        )
         r = post(f"{Cfg.OPENAI_API_BASE}/chat/completions",
                  headers={'Authorization': f'Bearer {Cfg.OPENAI_API_KEY}'}, json=data).json()
-        return (r['choices'][0]['message']['content'] or '').strip()
+        text = (r['choices'][0]['message']['content'] or '').strip()
+        log("[REALTIME][WS][LLM] response chars=%s", len(text))
+        return text
     except Exception:
         return ''
 
@@ -816,6 +837,11 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 vad_state['_trig'] = True
                 vad_state['_start_idx'] = max(0, len(frames) - vad_state['_v'] - pad_fr)
                 vad_state['_nv'] = 0
+                log(
+                    "[REALTIME][WS][VAD] speech_started start_idx=%s buffer_frames=%s",
+                    vad_state['_start_idx'],
+                    len(frames),
+                )
                 await send_async({"type": "input_audio_buffer.speech_started"})
         else:
             vad_state['_nv'] = 0 if f['v'] else vad_state['_nv'] + 1
@@ -831,6 +857,11 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 vad_state['_frames'] = frames[i1:]
                 vad_state['_trig'] = False; vad_state['_start_idx'] = None; vad_state['_v'] = vad_state['_nv'] = 0
                 log(f"[REALTIME][WS][VAD] turn committed reason={reason} frames={i1 - i0}")
+                log(
+                    "[REALTIME][WS][VAD] speech_stopped reason=%s chunk_ms=%s",
+                    reason,
+                    (i1 - i0) * FRAME_MS,
+                )
                 await send_async({"type": "input_audio_buffer.speech_stopped"})
                 min_voice_ms = max(0, int(vad_state.get('min_voice_ms', 0)))
                 min_voice_frames = (min_voice_ms + FRAME_MS - 1) // FRAME_MS if min_voice_ms else 0
