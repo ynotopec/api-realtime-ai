@@ -137,7 +137,7 @@ async function startRecording() {
         transcriptEl.textContent += msg.text;
       } else if (msg.type === "audio" && msg.audio) {
         playInt16Base64Audio(msg.audio);
-      } else if (msg.type === "response.done") {
+      } else if (msg.type === "response.completed") {
         transcriptEl.textContent += "\n--- turn done ---\n";
       } else if (msg.type === "event") {
         console.log("event:", msg);

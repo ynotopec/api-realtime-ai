@@ -92,11 +92,13 @@ async def websocket_endpoint(ws: WebSocket):
                         
 
                         # Send audio deltas back to browser
-                        if ev_type == "response.audio.delta":
-                            # event.delta is base64 audio (Int16) from OpenAI
+                        if ev_type == "response.output_audio.delta":
+                            # event.audio is base64 audio (Int16) from OpenAI
                             # forward to client as {type:'audio', audio: '<base64>'}
                             try:
-                                await ws.send_text(json.dumps({"type": "audio", "audio": event.delta}))
+                                audio_chunk = getattr(event, "audio", None) or getattr(event, "delta", None)
+                                if audio_chunk:
+                                    await ws.send_text(json.dumps({"type": "audio", "audio": audio_chunk}))
                             except Exception:
                                 logging.exception("Failed to forward audio to browser")
                         else:
@@ -132,8 +134,8 @@ async def websocket_endpoint(ws: WebSocket):
                                     pass
 
                         # response.done -> notify browser turn complete
-                        if ev_type == "response.done":
-                            await ws.send_text(json.dumps({"type": "response.done"}))
+                        if ev_type == "response.completed":
+                            await ws.send_text(json.dumps({"type": "response.completed"}))
                 except Exception as e:
                     logging.exception("listen_openai_and_forward error: %s", e)
                     raise

@@ -125,7 +125,7 @@ async function startRecording() {
       } else if (msg.type === "audio" && msg.audio) {
         // receive base64 Int16 PCM audio from server, play it.
         playInt16Base64Audio(msg.audio);
-      } else if (msg.type === "response.done") {
+      } else if (msg.type === "response.completed") {
         transcriptEl.textContent += "\n--- turn done ---\n";
       } else if (msg.type === "event") {
         console.log("event:", msg);
