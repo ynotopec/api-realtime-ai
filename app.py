@@ -455,7 +455,11 @@ def _transcribe_24k_pcm(pcm24: bytes) -> str:
         os.unlink(path)
 
 
-def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
+def _messages_from_items(
+    st: WSConv,
+    *,
+    extra_system_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     msgs: List[Dict[str, Any]] = []
     system_prompts: List[str] = []
     if Cfg.DEFAULT_SYSTEM_PROMPT:
@@ -463,6 +467,10 @@ def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
     instr = st.session.get('instructions')
     if instr:
         system_prompts.append(instr)
+    if extra_system_prompt:
+        prompt = str(extra_system_prompt).strip()
+        if prompt:
+            system_prompts.append(prompt)
     if system_prompts:
         msgs.append({'role': 'system', 'content': '\n\n'.join(system_prompts)})
 
@@ -478,9 +486,17 @@ def _messages_from_items(st: WSConv) -> List[Dict[str, Any]]:
     return msgs
 
 
-def _llm_reply_from_history(st: WSConv) -> str:
+def _llm_reply_from_history(
+    st: WSConv,
+    *,
+    extra_system_prompt: Optional[str] = None,
+) -> str:
     try:
-        data = {'model': Cfg.OPENAI_MODEL, 'messages': _messages_from_items(st), 'temperature': 0.3}
+        data = {
+            'model': Cfg.OPENAI_MODEL,
+            'messages': _messages_from_items(st, extra_system_prompt=extra_system_prompt),
+            'temperature': 0.3,
+        }
         r = post(f"{Cfg.OPENAI_API_BASE}/chat/completions",
                  headers={'Authorization': f'Bearer {Cfg.OPENAI_API_KEY}'}, json=data).json()
         return (r['choices'][0]['message']['content'] or '').strip()
@@ -545,8 +561,12 @@ async def realtime_ws_endpoint(websocket: WebSocket):
     }
 
     # Core response generator (runs in a thread)
-    def _handle_response_create():
-        messages = _messages_from_items(st)
+    def _handle_response_create(resp_options: Optional[Dict[str, Any]] = None):
+        extra_system_prompt = None
+        if resp_options:
+            extra_system_prompt = resp_options.get('instructions')
+
+        messages = _messages_from_items(st, extra_system_prompt=extra_system_prompt)
         if not messages or messages[-1].get('role') != 'user':
             log("[REALTIME][WS][RESP] skipped response.create → no user message available")
             send_from_thread(openai_error('no user message to respond to', 'client_error', None, 400))
@@ -571,7 +591,8 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         current_resp['id'] = rid
         current_resp['cancelled'] = False
 
-        try: ans = _llm_reply_from_history(st)
+        try:
+            ans = _llm_reply_from_history(st, extra_system_prompt=extra_system_prompt)
         except Exception as e:
             send_from_thread(openai_error(f'llm failed: {e}', 'internal_error', None, 500))
             response_done(rid, asst_item_id)
@@ -610,8 +631,8 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         st.add({'id': asst_item_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': ans}]})
         _prune_history(st)
 
-    def _start_response_thread():
-        t = threading.Thread(target=_handle_response_create, daemon=True)
+    def _start_response_thread(resp_options: Optional[Dict[str, Any]] = None):
+        t = threading.Thread(target=_handle_response_create, args=(resp_options,), daemon=True)
         t.start()
 
     # VAD processing (async, runs in main loop)
@@ -783,7 +804,31 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 ok = st.delete(item_id)
                 await send_async({'type': 'conversation.item.deleted', 'item_id': item_id, 'deleted': ok})
             elif t == 'response.create':
-                _start_response_thread()
+                resp_opts = d.get('response') or {}
+                extra_items: List[Dict[str, Any]] = []
+                for item in resp_opts.get('input') or []:
+                    if (item or {}).get('type') != 'message':
+                        continue
+                    role = item.get('role') or 'user'
+                    normalised = []
+                    for part in item.get('content') or []:
+                        if (part or {}).get('type') in ('input_text', 'text', 'output_text'):
+                            normalised.append({'type': 'input_text', 'text': part.get('text', '')})
+                        else:
+                            normalised.append(part)
+                    msg_item = {
+                        'id': item.get('id') or _nid('item'),
+                        'type': 'message',
+                        'role': role,
+                        'content': normalised,
+                    }
+                    st.add(msg_item)
+                    extra_items.append(msg_item)
+                if extra_items:
+                    _prune_history(st)
+                    for it in extra_items:
+                        await send_async({'type': 'conversation.item.created', 'item': it})
+                _start_response_thread(resp_opts or None)
             elif t == 'response.cancel':
                 rid = d.get('response', {}).get('id') or d.get('response_id')
                 if rid and current_resp.get('id') == rid:
