@@ -467,6 +467,7 @@ class WSConv:
     items: List[Dict[str, Any]] = field(default_factory=list)
     audio: bytearray = field(default_factory=bytearray)
     session: Dict[str, Any] = field(default_factory=_default_session_config)
+    model: str = Cfg.OPENAI_MODEL
 
     def add(self, item: Dict[str, Any]) -> Dict[str, Any]:
         self.items.append(item)
@@ -602,16 +603,22 @@ def _messages_from_items(st: WSConv, extra_system_prompt: Optional[str] = None) 
     return msgs
 
 
-def _llm_reply_from_history(st: WSConv, extra_system_prompt: Optional[str] = None) -> str:
+def _llm_reply_from_history(
+    st: WSConv,
+    extra_system_prompt: Optional[str] = None,
+    *,
+    model: Optional[str] = None,
+) -> str:
     try:
+        selected_model = (model or st.session.get('model') or st.model or Cfg.OPENAI_MODEL)
         data = {
-            'model': Cfg.OPENAI_MODEL,
+            'model': selected_model,
             'messages': _messages_from_items(st, extra_system_prompt=extra_system_prompt),
             'temperature': 0.3,
         }
         log(
             "[REALTIME][WS][LLM] request model=%s messages=%s",
-            Cfg.OPENAI_MODEL,
+            selected_model,
             len(data['messages']),
         )
         r = post(f"{Cfg.OPENAI_API_BASE}/chat/completions",
@@ -660,11 +667,16 @@ async def realtime_ws_endpoint(websocket: WebSocket):
     st.session.setdefault('sr', REALTIME_SR)
     st.session.setdefault('turn_detection', {'type': 'none'})
 
+    requested_model = (websocket.query_params.get('model') or '').strip()
+    if requested_model:
+        st.model = requested_model
+    st.session.setdefault('model', st.model)
+
     sess_id = _nid('sess')
     session_payload = _session_payload(sess_id, st.session)
     await send_async({'type': 'session.created', 'session': session_payload})
 
-    current_resp = {'id': None, 'cancelled': False, 'override_instructions': None, 'modalities': None}
+    current_resp = {'id': None, 'cancelled': False, 'override_instructions': None, 'modalities': None, 'model': None}
 
     vad_state = {
         'vad': webrtcvad.Vad(Cfg.DEFAULT_VAD_AGGR),
@@ -755,7 +767,12 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         current_resp['id'] = rid
         current_resp['cancelled'] = False
 
-        try: ans = _llm_reply_from_history(st, extra_system_prompt=override_instructions)
+        try:
+            ans = _llm_reply_from_history(
+                st,
+                extra_system_prompt=override_instructions,
+                model=current_resp.get('model') or st.model,
+            )
         except Exception as e:
             send_from_thread(openai_error(f'llm failed: {e}', 'internal_error', None, 500))
             response_done(rid, asst_item_id)
@@ -819,6 +836,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         _prune_history(st)
         current_resp['override_instructions'] = None
         current_resp['modalities'] = None
+        current_resp['model'] = None
 
     def _start_response_thread():
         t = threading.Thread(target=_handle_response_create, daemon=True)
@@ -911,8 +929,10 @@ async def realtime_ws_endpoint(websocket: WebSocket):
 
             if t == 'session.update':
                 sess = d.get('session') or {}
-                for k in ('input_audio_format', 'output_audio_format', 'voice', 'instructions'):
+                for k in ('input_audio_format', 'output_audio_format', 'voice', 'instructions', 'model'):
                     if k in sess: st.session[k] = sess[k]
+                if 'model' in sess and sess['model']:
+                    st.model = str(sess['model'])
                 if 'turn_detection' in sess:
                     td_in = sess['turn_detection'] or {}
                     td = dict(td_in)
@@ -1017,6 +1037,10 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                     current_resp['modalities'] = resp_payload.get('modalities')
                 else:
                     current_resp['modalities'] = None
+                if 'model' in resp_payload and resp_payload.get('model'):
+                    current_resp['model'] = str(resp_payload['model'])
+                else:
+                    current_resp['model'] = None
                 _start_response_thread()
             elif t == 'response.cancel':
                 rid = d.get('response', {}).get('id') or d.get('response_id')
