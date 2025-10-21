@@ -683,16 +683,54 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         def response_text_done(rid, item_id, full_text):
             send_from_thread({"type": "response.output_text.done", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text})
         def response_audio_delta(rid, item_id, b64chunk):
-            send_from_thread({"type": "response.audio.delta", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "delta": b64chunk})
+            send_from_thread(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": rid,
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "audio": b64chunk,
+                    "format": "pcm16",
+                    "sampling_rate": REALTIME_SR,
+                }
+            )
+
         def response_audio_done(rid, item_id):
-            send_from_thread({"type": "response.audio.done", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0})
+            send_from_thread(
+                {
+                    "type": "response.output_audio.done",
+                    "response_id": rid,
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                }
+            )
+
         def response_done(rid, asst_item_id):
-            send_from_thread({"type": "response.done", "response": {"id": rid, "output": [{"id": asst_item_id, "type": "message", "role": "assistant"}]}})
+            send_from_thread(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": rid,
+                        "output": [
+                            {"id": asst_item_id, "type": "message", "role": "assistant"}
+                        ],
+                    },
+                }
+            )
 
         rid = _nid('resp')
         asst_item_id = _nid('item')
         resp_created(rid)
-        send_from_thread({"type": "response.output_item.added", "response_id": rid, "output_index": 0, "item": {"id": asst_item_id, "type": "message", "role": "assistant"}})
+        send_from_thread(
+            {
+                "type": "response.output_item.created",
+                "response_id": rid,
+                "output_index": 0,
+                "item": {"id": asst_item_id, "type": "message", "role": "assistant"},
+            }
+        )
         current_resp['id'] = rid
         current_resp['cancelled'] = False
 

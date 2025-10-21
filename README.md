@@ -171,10 +171,13 @@ Server-side VAD is opt-in (via `session.update`), but the defaults above help ke
 * `conversation.item.created` / `retrieved` / `deleted`
 * `conversation.item.input_audio_transcription.completed`: Whisper transcription result for committed audio
 * `response.output_text.delta`: text token(s)
-* `response.audio.delta`: base64 PCM24k chunks
-* `response.done`: end of response
+* `response.output_audio.delta`: base64 PCM24k chunks (Int16 PCM, 24 kHz)
+* `response.output_audio.done`: marks the end of audio streaming for the item
+* `response.completed`: end of response
 * `response.cancelled`: emitted when the server cancels a response because of client request or VAD interruption
 * `error`: `{ error: { message: "..." } }`
+
+> ℹ️  See [docs/realtime-protocol-diff.md](docs/realtime-protocol-diff.md) for a summary of the known gaps with the latest OpenAI Realtime protocol (renamed events, additional fields, parallel responses, etc.).
 
 ---
 
