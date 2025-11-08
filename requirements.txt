@@ -12,3 +12,21 @@ webrtcvad
 # WebSocket implementation is included in uvicorn[standard]
 # or can be listed explicitly:
 websockets
+
+#
+# requirements.txt for the improved FastAPI Realtime AI WebSocket Server
+#
+# Install with: pip install -r requirements.txt
+#
+# Notes:
+# - ffmpeg must be installed separately on the system (e.g., apt install ffmpeg or brew install ffmpeg).
+# - This assumes Python 3.8+ for async/await and dataclasses.
+# - No additional audio libs (e.g., pydub, librosa) as the code uses NumPy + subprocess for processing.
+# - uvicorn[standard] includes WebSocket support via websockets.
+#
+
+#fastapi>=0.104.0
+#uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+#numpy>=1.24.0
+#webrtcvad>=2.0.10
