@@ -1,18 +1,18 @@
 # /home/ailab/api-realtime-ai/app.py
 import asyncio
 import base64
-import collections
-import io
 import json
 import logging
 import os
 import subprocess
+import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 
-import httpx
 import numpy as np
+import requests
 import webrtcvad
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -115,14 +115,18 @@ class Cfg:
 if not Cfg.OPENAI_API_KEY:
     raise RuntimeError("Missing mandatory env variable : OPENAI_API_KEY")
 
-# Async HTTP client with pooling
-async_client = httpx.AsyncClient(
-    timeout=Cfg.REQUEST_TIMEOUT,
-    limits=httpx.Limits(max_keepalive_connections=20, max_connections=20),
+session = requests.Session()
+session.mount(
+    "http://",
+    requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2),
+)
+session.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2),
 )
 
 
-async def _preview_payload(options: MutableMapping[str, Any]) -> Dict[str, Any]:
+def _preview_payload(options: MutableMapping[str, Any]) -> Dict[str, Any]:
     """Build a lightweight preview of an HTTP payload for safe logging."""
     preview: Dict[str, Any] = {}
     for key in ("json", "data"):
@@ -135,25 +139,25 @@ async def _preview_payload(options: MutableMapping[str, Any]) -> Dict[str, Any]:
     return preview
 
 
-async def apost(url: str, **kwargs: Any) -> httpx.Response:
-    """Async POST wrapper that centralises logging, timeouts and error handling."""
+def post(url: str, **kwargs: Any) -> requests.Response:
+    """POST wrapper that centralises logging, timeouts and error handling."""
     kwargs.setdefault("timeout", Cfg.REQUEST_TIMEOUT)
-    payload_preview = await _preview_payload(kwargs)
+    payload_preview = _preview_payload(kwargs)
     log(
         "[IO][HTTP][OUTBOUND] POST %s opts={'timeout': %s} payload=%s",
         url,
         kwargs.get("timeout"),
         payload_preview,
     )
-    async with async_client.post(url, **kwargs) as response:
-        log(
-            "[IO][HTTP][OUTBOUND][RESPONSE] url=%s status=%s length=%s",
-            url,
-            response.status_code,
-            len(await response.aread()),
-        )
-        response.raise_for_status()
-        return response
+    response = session.post(url, **kwargs)
+    log(
+        "[IO][HTTP][OUTBOUND][RESPONSE] url=%s status=%s length=%s",
+        url,
+        response.status_code,
+        len(response.content),
+    )
+    response.raise_for_status()
+    return response
 
 
 # ────────────────────────────── Helpers ──────────────────────────────
@@ -171,40 +175,25 @@ _RESAMPLE_I1_24_TO_16 = np.minimum(_RESAMPLE_I0_24_TO_16 + 1, SMP_24K - 1)
 _RESAMPLE_FRAC_24_TO_16 = _RESAMPLE_POS_24_TO_16 - _RESAMPLE_I0_24_TO_16
 
 
-async def call_whisper(file_bytes: bytes) -> Dict[str, Any]:
+def call_whisper(file) -> Dict[str, Any]:
     """Send the uploaded audio blob to the Whisper transcription backend."""
-    # Use BytesIO for in-memory file handling
+    # Some endpoints expect the "model" field to be part of the multipart form-data
+    # rather than the request body. Align with the historically working payload
+    # structure to maximise compatibility with both the legacy and current
+    # backends.
     files = {
-        'file': ('audio.webm', io.BytesIO(file_bytes), 'audio/webm'),
+        'file': (file.filename, file.stream, 'audio/webm'),
         'model': (None, 'whisper-1'),
     }
     stt_url = f"{Cfg.STT_API_BASE.rstrip('/')}/audio/transcriptions"
-    async with async_client.post(
+    return post(
         stt_url,
         headers={'Authorization': f'Bearer {Cfg.STT_API_KEY}'},
         files=files
-    ) as resp:
-        return await resp.json()
+    ).json()
 
 
-def _run_ffmpeg_pipe(cmd: List[str], input_data: bytes) -> bytes:
-    """Run ffmpeg with stdin/stdout piping for in-memory processing."""
-    if not input_data:
-        return b''
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        bufsize=0  # Unbuffered
-    )
-    stdout, _ = proc.communicate(input=input_data)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed with return code {proc.returncode}")
-    return stdout
-
-
-async def call_tts_webm(text: str, voice: str, instructions: str) -> bytes:
+def call_tts_webm(text: str, voice: str, instructions: str) -> bytes:
     payload = {
         'model': 'gpt-4o-mini-tts',
         'input': text,
@@ -213,52 +202,24 @@ async def call_tts_webm(text: str, voice: str, instructions: str) -> bytes:
         'response_format': 'opus'
     }
     tts_url = f"{Cfg.TTS_API_BASE.rstrip('/')}/audio/speech"
-    async with async_client.post(
+    return post(
         tts_url,
         headers={'Authorization': f'Bearer {Cfg.TTS_API_KEY}', 'Content-Type': 'application/json'},
         json=payload
-    ) as resp:
-        return await resp.aread()
+    ).content
 
 
 def call_tts_pcm16le(text: str, voice: str, instructions: str) -> bytes:
-    webm = asyncio.run(call_tts_webm(text, voice, instructions))  # Sync wrapper for now; can be awaited in async context
-    # Pipe WebM to PCM16@16kHz
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', 'pipe:0',  # Read WebM from stdin
-        '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-        'pipe:1'  # Write PCM to stdout
-    ]
-    return _run_ffmpeg_pipe(cmd, webm)
-
-
-def _resample_pcm_ffmpeg(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
-    cmd = [
-        'ffmpeg', '-y',
-        '-f', 's16le', '-ar', str(sr_in), '-ac', '1',
-        '-i', 'pipe:0',
-        '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', str(sr_out), '-ac', '1',
-        'pipe:1'
-    ]
-    return _run_ffmpeg_pipe(cmd, pcm)
-
-
-def _pcm24k_to_webm_for_whisper(pcm: bytes) -> bytes:
-    """Convert PCM24k to WebM/Opus in memory via ffmpeg pipe."""
-    cmd = [
-        'ffmpeg', '-y',
-        '-f', 's16le', '-ar', str(REALTIME_SR), '-ac', '1',
-        '-i', 'pipe:0',
-        '-c:a', 'libopus', '-b:a', '32k',
-        'pipe:1'
-    ]
-    return _run_ffmpeg_pipe(cmd, pcm)
-
-
-async def _transcribe_24k_pcm(pcm24: bytes) -> str:
-    webm_bytes = _pcm24k_to_webm_for_whisper(pcm24)
-    return (await call_whisper(webm_bytes) or {}).get('text', '').strip()
+    webm = call_tts_webm(text, voice, instructions)
+    with tempfile.NamedTemporaryFile(suffix='.webm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
+        fi.write(webm)
+        fi.flush()
+        subprocess.check_output(
+            ['ffmpeg', '-y', '-i', fi.name, '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', fo.name],
+            stderr=subprocess.DEVNULL
+        )
+        fo.seek(0)
+        return fo.read()
 
 
 def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
@@ -283,6 +244,61 @@ def _resample_24k_to_16k_linear(b24: bytes) -> bytes:
         diff = src_f[i1] - base
         out = base + diff * frac
     return np.clip(out, -32768.0, 32767.0).astype(np.int16, copy=False).tobytes()
+
+
+def _resample_pcm_ffmpeg(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix='.pcm') as fi, tempfile.NamedTemporaryFile(suffix='.pcm') as fo:
+        fi.write(pcm)
+        fi.flush()
+        subprocess.check_output(
+            ['ffmpeg', '-y', '-f', 's16le', '-ar', str(sr_in), '-ac', '1', '-i', fi.name,
+             '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', str(sr_out), '-ac', '1', fo.name],
+            stderr=subprocess.DEVNULL
+        )
+        fo.seek(0)
+        return fo.read()
+
+
+def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
+    """Persist a PCM24k buffer to disk and transcode it to WebM via ffmpeg."""
+    f_pcm = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
+    f_webm = tempfile.NamedTemporaryFile(suffix='.webm', delete=False)
+    pcm_path = f_pcm.name
+    webm_path = f_webm.name
+    success = False
+    try:
+        f_pcm.write(pcm)
+        f_pcm.flush()
+        subprocess.check_output(
+            [
+                'ffmpeg', '-y',
+                '-f', 's16le', '-ar', str(REALTIME_SR), '-ac', '1',
+                '-i', pcm_path,
+                '-c:a', 'libopus', '-b:a', '32k',
+                webm_path
+            ],
+            stderr=subprocess.DEVNULL
+        )
+        success = True
+        return webm_path
+    finally:
+        try:
+            f_pcm.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(pcm_path)
+        except OSError:
+            pass
+        try:
+            f_webm.close()
+        except Exception:
+            pass
+        if not success:
+            try:
+                os.unlink(webm_path)
+            except OSError:
+                pass
 
 
 # ────────────────────────────── FastAPI App ──────────────────────────────
@@ -425,7 +441,21 @@ async def _send_ws_json_async(
         log("[IO][WS][SEND][ERROR] %s", exc)
 
 
-async def _messages_from_items(
+def _transcribe_24k_pcm(pcm24: bytes) -> str:
+    path = _pcm24k_to_webm_for_whisper(pcm24)
+    class DF:
+        filename = 'audio.webm'
+    df = DF()
+    df.stream = open(path, 'rb')
+    df.content_length = os.path.getsize(path)
+    try:
+        return (call_whisper(df) or {}).get('text', '').strip()
+    finally:
+        df.stream.close()
+        os.unlink(path)
+
+
+def _messages_from_items(
     st: WSConv,
     *,
     extra_system_prompt: Optional[str] = None,
@@ -456,25 +486,20 @@ async def _messages_from_items(
     return msgs
 
 
-async def _llm_reply_from_history(
+def _llm_reply_from_history(
     st: WSConv,
     *,
     extra_system_prompt: Optional[str] = None,
 ) -> str:
     try:
-        messages = await _messages_from_items(st, extra_system_prompt=extra_system_prompt)
         data = {
             'model': Cfg.OPENAI_MODEL,
-            'messages': messages,
+            'messages': _messages_from_items(st, extra_system_prompt=extra_system_prompt),
             'temperature': 0.3,
         }
-        async with async_client.post(
-            f"{Cfg.OPENAI_API_BASE}/chat/completions",
-            headers={'Authorization': f'Bearer {Cfg.OPENAI_API_KEY}'},
-            json=data
-        ) as r:
-            resp_json = await r.json()
-            return (resp_json['choices'][0]['message']['content'] or '').strip()
+        r = post(f"{Cfg.OPENAI_API_BASE}/chat/completions",
+                 headers={'Authorization': f'Bearer {Cfg.OPENAI_API_KEY}'}, json=data).json()
+        return (r['choices'][0]['message']['content'] or '').strip()
     except Exception:
         return ''
 
@@ -494,12 +519,24 @@ async def realtime_ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     log('[REALTIME][WS] connection accepted')
 
+    loop = asyncio.get_running_loop()
     send_lock = asyncio.Lock()
     st = WSConv()
 
     async def send_async(obj):
         """Async sender for the main event loop."""
         await _send_ws_json_async(websocket, obj, lock=send_lock)
+
+    def send_from_thread(obj):
+        """Thread-safe sender for background tasks."""
+        future = asyncio.run_coroutine_threadsafe(send_async(obj), loop)
+
+        def log_exception(fut):
+            try:
+                fut.result(timeout=0.1)  # Non-blocking check for immediate errors
+            except Exception as e:
+                log(f"[IO][WS][SEND][THREAD_ERROR] {e}")
+        future.add_done_callback(log_exception)
 
     st.session.setdefault('sr', REALTIME_SR)
     st.session.setdefault('turn_detection', {'type': 'none'})
@@ -510,8 +547,6 @@ async def realtime_ws_endpoint(websocket: WebSocket):
 
     current_resp = {'id': None, 'cancelled': False}
 
-    # VAD state with deque for bounded buffering
-    max_frames = int(Cfg.DEFAULT_VAD_MAX_MS / FRAME_MS) + 10  # Buffer for padding
     vad_state = {
         'vad': webrtcvad.Vad(Cfg.DEFAULT_VAD_AGGR),
         'aggr': Cfg.DEFAULT_VAD_AGGR,
@@ -520,60 +555,59 @@ async def realtime_ws_endpoint(websocket: WebSocket):
         'pad_ms': Cfg.DEFAULT_VAD_PAD_MS,
         'max_ms': max(Cfg.DEFAULT_VAD_MAX_MS, Cfg.DEFAULT_VAD_END_MS + Cfg.DEFAULT_VAD_PAD_MS, Cfg.DEFAULT_VAD_START_MS + 20),
         'min_voice_ms': Cfg.DEFAULT_VAD_MIN_VOICE_MS,
-        '_frames': collections.deque(maxlen=max_frames),
-        '_trig': False, '_start_idx': None, '_v': 0, '_nv': 0,
+        '_frames': [], '_trig': False, '_start_idx': None, '_v': 0, '_nv': 0,
         'auto_create_response': Cfg.DEFAULT_VAD_AUTORESP,
         'interrupt_response': Cfg.DEFAULT_VAD_INTERRUPT_RESPONSE,
     }
 
-    # Async response handler (no more threads)
-    async def _handle_response_create(resp_options: Optional[Dict[str, Any]] = None):
+    # Core response generator (runs in a thread)
+    def _handle_response_create(resp_options: Optional[Dict[str, Any]] = None):
         extra_system_prompt = None
         if resp_options:
             extra_system_prompt = resp_options.get('instructions')
 
-        messages = await _messages_from_items(st, extra_system_prompt=extra_system_prompt)
+        messages = _messages_from_items(st, extra_system_prompt=extra_system_prompt)
         if not messages or messages[-1].get('role') != 'user':
             log("[REALTIME][WS][RESP] skipped response.create → no user message available")
-            await send_async(openai_error('no user message to respond to', 'client_error', None, 400))
+            send_from_thread(openai_error('no user message to respond to', 'client_error', None, 400))
             return
 
-        async def resp_created(rid): await send_async({'type': 'response.created', 'response': {'id': rid}})
-        async def response_text_delta(rid, item_id, token):
-            await send_async({"type": "response.output_text.delta", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "delta": token})
-        async def response_text_done(rid, item_id, full_text):
-            await send_async({"type": "response.output_text.done", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text})
-        async def response_audio_delta(rid, item_id, b64chunk):
-            await send_async({"type": "response.audio.delta", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "delta": b64chunk})
-        async def response_audio_done(rid, item_id):
-            await send_async({"type": "response.audio.done", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0})
-        async def response_done(rid, asst_item_id):
-            await send_async({"type": "response.done", "response": {"id": rid, "output": [{"id": asst_item_id, "type": "message", "role": "assistant"}]}})
+        def resp_created(rid): send_from_thread({'type': 'response.created', 'response': {'id': rid}})
+        def response_text_delta(rid, item_id, token):
+            send_from_thread({"type": "response.output_text.delta", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "delta": token})
+        def response_text_done(rid, item_id, full_text):
+            send_from_thread({"type": "response.output_text.done", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text})
+        def response_audio_delta(rid, item_id, b64chunk):
+            send_from_thread({"type": "response.audio.delta", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0, "delta": b64chunk})
+        def response_audio_done(rid, item_id):
+            send_from_thread({"type": "response.audio.done", "response_id": rid, "item_id": item_id, "output_index": 0, "content_index": 0})
+        def response_done(rid, asst_item_id):
+            send_from_thread({"type": "response.done", "response": {"id": rid, "output": [{"id": asst_item_id, "type": "message", "role": "assistant"}]}})
 
         rid = _nid('resp')
         asst_item_id = _nid('item')
-        await resp_created(rid)
-        await send_async({"type": "response.output_item.added", "response_id": rid, "output_index": 0, "item": {"id": asst_item_id, "type": "message", "role": "assistant"}})
+        resp_created(rid)
+        send_from_thread({"type": "response.output_item.added", "response_id": rid, "output_index": 0, "item": {"id": asst_item_id, "type": "message", "role": "assistant"}})
         current_resp['id'] = rid
         current_resp['cancelled'] = False
 
         try:
-            ans = await _llm_reply_from_history(st, extra_system_prompt=extra_system_prompt)
+            ans = _llm_reply_from_history(st, extra_system_prompt=extra_system_prompt)
         except Exception as e:
-            await send_async(openai_error(f'llm failed: {e}', 'internal_error', None, 500))
-            await response_done(rid, asst_item_id)
+            send_from_thread(openai_error(f'llm failed: {e}', 'internal_error', None, 500))
+            response_done(rid, asst_item_id)
             return
 
         if current_resp['cancelled']:
-            await send_async({'type': 'response.cancelled', 'response': {'id': rid}})
-            await response_done(rid, asst_item_id)
+            send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}})
+            response_done(rid, asst_item_id)
             return
 
         # Align with OpenAI's realtime responses: send a single delta containing the
         # full text rather than tokenising locally (which caused cumulative repeats
         # client-side).
-        await response_text_delta(rid, asst_item_id, ans)
-        await response_text_done(rid, asst_item_id, ans)
+        response_text_delta(rid, asst_item_id, ans)
+        response_text_done(rid, asst_item_id, ans)
 
         voice = st.session.get('voice', 'shimmer')
         tts_instructions = (
@@ -588,17 +622,18 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 hop = int(REALTIME_SR * 0.2) * 2
                 for i in range(0, len(pcm24), hop):
                     if current_resp['cancelled']:
-                        await send_async({'type': 'response.cancelled', 'response': {'id': rid}}); break
-                    await response_audio_delta(rid, asst_item_id, _b64(pcm24[i:i + hop]))
-                if not current_resp['cancelled']: await response_audio_done(rid, asst_item_id)
-        except Exception as e: await send_async(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
+                        send_from_thread({'type': 'response.cancelled', 'response': {'id': rid}}); break
+                    response_audio_delta(rid, asst_item_id, _b64(pcm24[i:i + hop]))
+                if not current_resp['cancelled']: response_audio_done(rid, asst_item_id)
+        except Exception as e: send_from_thread(openai_error(f'tts failed: {e}', 'internal_error', None, 500))
 
-        await response_done(rid, asst_item_id)
+        response_done(rid, asst_item_id)
         st.add({'id': asst_item_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': ans}]})
         _prune_history(st)
 
-    def _start_response_task(resp_options: Optional[Dict[str, Any]] = None):
-        asyncio.create_task(_handle_response_create(resp_options))
+    def _start_response_thread(resp_options: Optional[Dict[str, Any]] = None):
+        t = threading.Thread(target=_handle_response_create, args=(resp_options,), daemon=True)
+        t.start()
 
     # VAD processing (async, runs in main loop)
     async def _process_vad_buffer():
@@ -624,21 +659,18 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 if i1 <= i0:
                     vad_state['_trig'] = False; vad_state['_start_idx'] = None; vad_state['_v'] = vad_state['_nv'] = 0
                     return
-                # Extract frames (deque slicing returns list)
-                chunk_frames = list(frames)[i0:i1]
-                b = b''.join(fr['b24'] for fr in chunk_frames)
-                # Remove processed frames
-                for _ in range(i1): frames.popleft() if i1 > 0 else None
+                b = b''.join(fr['b24'] for fr in frames[i0:i1])
+                vad_state['_frames'] = frames[i1:]
                 vad_state['_trig'] = False; vad_state['_start_idx'] = None; vad_state['_v'] = vad_state['_nv'] = 0
                 log(f"[REALTIME][WS][VAD] turn committed reason={reason} frames={i1 - i0}")
                 await send_async({"type": "input_audio_buffer.speech_stopped"})
                 min_voice_ms = max(0, int(vad_state.get('min_voice_ms', 0)))
                 min_voice_frames = (min_voice_ms + FRAME_MS - 1) // FRAME_MS if min_voice_ms else 0
-                chunk_frames_count = i1 - i0
-                if min_voice_frames and chunk_frames_count < min_voice_frames:
+                chunk_frames = i1 - i0
+                if min_voice_frames and chunk_frames < min_voice_frames:
                     log(
                         "[REALTIME][WS][VAD] ignoring short chunk duration_ms=%s threshold_ms=%s",
-                        chunk_frames_count * FRAME_MS,
+                        chunk_frames * FRAME_MS,
                         min_voice_ms,
                     )
                     return
@@ -647,12 +679,12 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                     user_item = {'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'mime_type': f'audio/pcm;rate={REALTIME_SR}'}]}
                     st.add(user_item); _prune_history(st)
                     await send_async({'type': 'conversation.item.created', 'item': user_item})
-                    try: tr = await _transcribe_24k_pcm(b) if b else ''
+                    try: tr = _transcribe_24k_pcm(b) if b else ''
                     except Exception as e: log(f"[REALTIME][WS][VAD][WHISPER] transcription error: {e}"); tr = ''
                     tr_norm = tr.strip()
                     await send_async({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr_norm})
                     st.items = [({'id': uid, 'type': 'message', 'role': 'user', 'content': [{'type': 'input_audio', 'transcript': tr_norm}]} if x['id'] == uid else x) for x in st.items]
-                    if vad_state.get('auto_create_response') and tr_norm: _start_response_task()
+                    if vad_state.get('auto_create_response') and tr_norm: _start_response_thread()
                 except Exception as exc: log(f"[REALTIME][WS][VAD][COMMIT] error: {exc}")
 
     async def _on_append_feed_vad(chunk_bytes):
@@ -728,9 +760,6 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                         td.setdefault('aggressiveness', vad_state['aggr'])
                         td.setdefault('create_response', vad_state['auto_create_response'])
                         td.setdefault('interrupt_response', vad_state['interrupt_response'])
-                        # Update deque maxlen if max_ms changes
-                        new_max_frames = int(vad_state['max_ms'] / FRAME_MS) + 10
-                        vad_state['_frames'] = collections.deque(vad_state['_frames'], maxlen=new_max_frames)
                 session_payload = _session_payload(sess_id, st.session)
                 await send_async({'type': 'session.updated', 'session': session_payload})
             elif t == 'input_audio_buffer.append':
@@ -751,7 +780,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 pcm = bytes(st.audio); st.audio.clear()
                 vad_state['_frames'].clear(); vad_state['_trig'] = False; vad_state['_start_idx'] = None; vad_state['_v'] = vad_state['_nv'] = 0
                 await send_async({"type": "input_audio_buffer.committed"})
-                try: tr = await _transcribe_24k_pcm(pcm) if pcm else ''
+                try: tr = _transcribe_24k_pcm(pcm) if pcm else ''
                 except Exception as e: log(f"[REALTIME][WS][WHISPER] transcription error: {e}"); tr = ''
                 tr_norm = tr.strip()
                 await send_async({"type": "conversation.item.input_audio_transcription.completed", "item_id": uid, "transcript": tr_norm})
@@ -759,7 +788,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 td = st.session.get('turn_detection', {}) or {}
                 if ((td.get('type') == 'server_vad' and vad_state.get('auto_create_response')) or os.getenv('COMMIT_AUTORESP', '1') == '1') and tr_norm:
                     log("[REALTIME][WS][COMMIT] auto_create_response → response.create()")
-                    _start_response_task()
+                    _start_response_thread()
             elif t == 'conversation.item.create':
                 it = d.get('item') or {}
                 if it.get('type') == 'message' and it.get('role') in ('user', 'system'):
@@ -799,7 +828,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                     _prune_history(st)
                     for it in extra_items:
                         await send_async({'type': 'conversation.item.created', 'item': it})
-                _start_response_task(resp_opts or None)
+                _start_response_thread(resp_opts or None)
             elif t == 'response.cancel':
                 rid = d.get('response', {}).get('id') or d.get('response_id')
                 if rid and current_resp.get('id') == rid:
