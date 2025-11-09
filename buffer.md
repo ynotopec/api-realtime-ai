@@ -1,4 +1,4 @@
-grok-4-fast-reasoning:
+grok-4-fast-reasoning (KO):
 
 Yes, it is possible to make significant improvements in efficiency for this application. The code is already reasonably well-structured for a real-time WebSocket-based AI conversation system (handling VAD, transcription, LLM, and TTS), but there are clear bottlenecks in performance (latency and CPU usage), resource consumption (I/O and memory), and scalability. These stem primarily from synchronous blocking operations, heavy reliance on subprocesses (e.g., ffmpeg), temporary file I/O, and some redundant processing.
 
