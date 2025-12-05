@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
+from observability import inject_tracing_headers, record_model_inference, record_token_usage
 
 DEFAULT_DB_PATH = Path(os.getenv("FEEDBACK_DB", "data/feedback.db"))
 DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -215,11 +216,14 @@ def _extract_delta_text(chunk: Dict[str, Any]) -> str:
 async def _stream_response(payload: Dict[str, Any], channel: str, prompt: str) -> StreamingResponse:
     url = f"{OPENAI_BASE}/chat/completions"
     final_text: List[str] = []
+    headers = _headers()
+    inject_tracing_headers(headers)
 
     async def event_stream():
         nonlocal final_text
+        start = time.perf_counter()
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-            async with client.stream("POST", url, headers=_headers(), json=payload) as resp:
+            async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 if resp.status_code >= 400:
                     body = await resp.aread()
                     raise HTTPException(status_code=resp.status_code, detail=body.decode())
@@ -243,16 +247,23 @@ async def _stream_response(payload: Dict[str, Any], channel: str, prompt: str) -
         full_text = "".join(final_text).strip()
         if full_text:
             conversations.append(channel, [{"role": "assistant", "content": full_text}])
+        duration = time.perf_counter() - start
+        record_model_inference(duration, payload.get("model"))
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 async def _invoke_non_stream(payload: Dict[str, Any], channel: str) -> Dict[str, Any]:
     url = f"{OPENAI_BASE}/chat/completions"
+    headers = _headers()
+    inject_tracing_headers(headers)
+    start = time.perf_counter()
     async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-        resp = await client.post(url, headers=_headers(), json=payload)
+        resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        duration = time.perf_counter() - start
+        record_model_inference(duration, payload.get("model"))
         data = resp.json()
     try:
         content = data["choices"][0]["message"]["content"]
@@ -260,6 +271,14 @@ async def _invoke_non_stream(payload: Dict[str, Any], channel: str) -> Dict[str,
         content = ""
     if content:
         conversations.append(channel, [{"role": "assistant", "content": content}])
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if usage:
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if prompt_tokens is not None:
+            record_token_usage(prompt_tokens, "prompt", payload.get("model"))
+        if completion_tokens is not None:
+            record_token_usage(completion_tokens, "completion", payload.get("model"))
     return data
 
 

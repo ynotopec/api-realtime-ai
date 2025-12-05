@@ -5,6 +5,14 @@ uvicorn[standard]
 # External API Communication
 requests
 httpx
+python-json-logger
+
+# Observability
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-exporter-otlp
+prometheus_fastapi_instrumentator
+prometheus_client
 
 # Audio Processing
 numpy
