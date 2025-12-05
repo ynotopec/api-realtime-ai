@@ -1,0 +1,51 @@
+name: Load test and gated deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_prod:
+        description: "Deploy to production after load test"
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  load-test:
+    name: Run k6 load tests against dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup k6
+        uses: grafana/setup-k6@v1
+
+      - name: Run realtime load tests
+        env:
+          BASE_URL: ${{ secrets.DEV_BASE_URL }}
+          WS_URL: ${{ secrets.DEV_WS_URL }}
+          FEEDBACK_URL: ${{ secrets.DEV_FEEDBACK_URL }}
+          API_TOKEN: ${{ secrets.DEV_API_TOKEN }}
+        run: |
+          k6 run load-tests/k6-realtime.js --summary-export load-tests/k6-summary.json
+
+      - name: Upload load test summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-summary
+          path: load-tests/k6-summary.json
+
+  deploy-prod:
+    name: Deploy to production (gated)
+    needs: load-test
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_prod }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require green load test before deploy
+        run: echo "Load tests passed; trigger your deployment script here."

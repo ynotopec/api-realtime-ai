@@ -61,6 +61,7 @@ Browser mic (24k PCM)  ──► FastAPI WebSocket (/v1/realtime)
 * **Token gate** for realtime endpoints via `API_TOKENS`.
 * **OpenAI-compatible REST chat** at `/v1/chat/completions` with SSE streaming and group channels.
 * **Feedback endpoints** (`/v1/feedback*`) that feed a self-improvement loop to tune prompts/model routing.
+* **Transcript storage & replay** via `/api/transcripts/*` endpoints and a small UI at `/ui/transcripts`.
 
 ---
 
@@ -115,6 +116,15 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 
 See [docs/gpu-setup.md](docs/gpu-setup.md) for a step-by-step recipe that installs CUDA-enabled `torch`, configures
 chat defaults, and exercises the OpenAI-compatible endpoints inside a Python 3.11 virtual environment.
+### 3) Frontend chat UI (React + Vite)
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+The UI streams markdown-formatted replies, displays message history with replay controls, and captures inline thumbs-up/down feedback. Environment variables in `web/.env.example` let you point dev/prod builds at different realtime base URLs or optional group channels.
 
 ---
 
@@ -153,6 +163,16 @@ Server-side VAD is opt-in (via `session.update`), but the defaults above help ke
 * **Input** realtime: base64 **PCM16** at **24 kHz** (frame size = 20 ms, 960 bytes).
 * Whisper upload: `audio/webm` (Opus) is produced internally from PCM using `ffmpeg`.
 * TTS: external API returns WebM/Opus; helper converts to **PCM16 24 kHz** for streaming and **16 kHz** where needed.
+
+### Transcript storage & replay
+
+* Transcripts are persisted to SQLite at `TRANSCRIPTS_DB_PATH` (defaults to `transcripts.db` alongside `app.py`).
+* REST endpoints:
+  * `GET /api/transcripts` – list recorded sessions.
+  * `GET /api/transcripts/{session_id}` – fetch a full transcript blob (items, session config, metadata).
+  * `POST /api/transcripts/{session_id}/replay` – rebuild a deterministic replay timeline (optional `seed` override).
+  * `POST /api/transcripts/{session_id}/feedback` – attach structured or free-form feedback.
+* A lightweight browser UI is available at `/ui/transcripts` for selecting and replaying saved sessions.
 
 ---
 

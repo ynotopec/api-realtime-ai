@@ -1,0 +1,11 @@
+# Common Helm ignores
+*.swp
+*.bak
+*.tmp
+.git/
+.hg/
+.svn/
+.idea/
+.vscode/
+node_modules/
+.DS_Store

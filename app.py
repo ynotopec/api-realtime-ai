@@ -4,18 +4,22 @@ import base64
 import json
 import logging
 import os
+import random
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 
 import numpy as np
 import requests
 import webrtcvad
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 from chat_completions import router as chat_router
 
@@ -84,6 +88,123 @@ def _summarize_payload(payload: Any, *, limit: int = 200) -> str:
         return f'<unserializable payload: {exc}>'
 
 
+# ────────────────────────────── Persistence helpers ──────────────────────────────
+TRANSCRIPTS_DB_PATH = (
+    os.getenv('TRANSCRIPTS_DB_PATH')
+    or str(Path(__file__).with_name('transcripts.db'))
+)
+
+
+def _init_transcript_db() -> None:
+    Path(TRANSCRIPTS_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(TRANSCRIPTS_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transcripts (
+                session_id TEXT PRIMARY KEY,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                seed INTEGER,
+                session_config TEXT,
+                items TEXT,
+                feedback TEXT,
+                model_params TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def _serialize_json_blob(data: Any) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return "{}"
+
+
+def _deserialize_json_blob(raw: Optional[str]) -> Any:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _store_transcript(
+    *,
+    session_id: str,
+    seed: int,
+    session_config: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    feedback: Optional[Any],
+    model_params: Dict[str, Any],
+) -> None:
+    payload = (
+        session_id,
+        seed,
+        _serialize_json_blob(session_config),
+        _serialize_json_blob(items),
+        _serialize_json_blob(feedback),
+        _serialize_json_blob(model_params),
+    )
+    with sqlite3.connect(TRANSCRIPTS_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO transcripts (session_id, seed, session_config, items, feedback, model_params)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                seed=excluded.seed,
+                session_config=excluded.session_config,
+                items=excluded.items,
+                feedback=excluded.feedback,
+                model_params=excluded.model_params
+            """,
+            payload,
+        )
+        conn.commit()
+
+
+def _list_transcripts(limit: int = 100) -> List[Dict[str, Any]]:
+    with sqlite3.connect(TRANSCRIPTS_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT session_id, created_at, feedback FROM transcripts ORDER BY datetime(created_at) DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def _get_transcript(session_id: str) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(TRANSCRIPTS_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT session_id, created_at, seed, session_config, items, feedback, model_params FROM transcripts WHERE session_id=?",
+            (session_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        'session_id': row['session_id'],
+        'created_at': row['created_at'],
+        'seed': row['seed'],
+        'session_config': _deserialize_json_blob(row['session_config']) or {},
+        'items': _deserialize_json_blob(row['items']) or [],
+        'feedback': _deserialize_json_blob(row['feedback']) or None,
+        'model_params': _deserialize_json_blob(row['model_params']) or {},
+    }
+
+
+def _update_transcript_feedback(session_id: str, feedback: Any) -> bool:
+    with sqlite3.connect(TRANSCRIPTS_DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE transcripts SET feedback=? WHERE session_id=?",
+            (_serialize_json_blob(feedback), session_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 class Cfg:
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
     OPENAI_API_BASE = os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1')
@@ -112,6 +233,7 @@ class Cfg:
     DEFAULT_VAD_MIN_VOICE_MS = _env_int('DEFAULT_VAD_MIN_VOICE_MS', 3000, minimum=0)
     DEFAULT_VAD_AUTORESP = _coerce_bool(os.getenv('DEFAULT_VAD_AUTORESP'), True)
     DEFAULT_VAD_INTERRUPT_RESPONSE = _coerce_bool(os.getenv('DEFAULT_VAD_INTERRUPT_RESPONSE'), False)
+    TRANSCRIPTS_DB_PATH = TRANSCRIPTS_DB_PATH
 
 
 if not Cfg.OPENAI_API_KEY:
@@ -126,6 +248,8 @@ session.mount(
     "https://",
     requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2),
 )
+
+_init_transcript_db()
 
 
 def _preview_payload(options: MutableMapping[str, Any]) -> Dict[str, Any]:
@@ -313,6 +437,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(chat_router)
+
+
+# ────────────────────────────── Transcript API ──────────────────────
+@app.get('/api/transcripts')
+async def list_transcripts(limit: int = 100) -> Dict[str, Any]:
+    return {'transcripts': _list_transcripts(limit)}
+
+
+@app.get('/api/transcripts/{session_id}')
+async def get_transcript(session_id: str) -> Dict[str, Any]:
+    transcript = _get_transcript(session_id)
+    if not transcript:
+        raise HTTPException(status_code=404, detail='session not found')
+    return transcript
+
+
+@app.post('/api/transcripts/{session_id}/feedback')
+async def set_transcript_feedback(session_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    feedback = (payload or {}).get('feedback')
+    if not _update_transcript_feedback(session_id, feedback):
+        raise HTTPException(status_code=404, detail='session not found')
+    return {'session_id': session_id, 'feedback': feedback}
+
+
+@app.post('/api/transcripts/{session_id}/replay')
+async def replay_transcript(session_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    transcript = _get_transcript(session_id)
+    if not transcript:
+        raise HTTPException(status_code=404, detail='session not found')
+    payload = payload or {}
+    seed_override = payload.get('seed')
+    if seed_override is not None:
+        seed_override = _coerce_int(seed_override, transcript.get('seed') or 0, minimum=0)
+    session_override = payload.get('session_override') or {}
+    return _build_replay_timeline(transcript, seed_override=seed_override, session_override=session_override)
+
+
+@app.get('/ui/transcripts', response_class=HTMLResponse)
+async def transcripts_ui() -> HTMLResponse:
+    html_path = Path(__file__).parent / 'external-test' / 'transcript-replay.html'
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail='ui not found')
+    return HTMLResponse(html_path.read_text(encoding='utf-8'))
 
 
 # ────────────────────────────── WS bridge (/v1/realtime) ──────────────────────
@@ -512,6 +679,52 @@ def _prune_history(st: WSConv, max_items: int = int(os.getenv('MAX_HISTORY_ITEMS
         st.items = st.items[-max_items:]
 
 
+def _model_params_snapshot(st: WSConv, seed: int) -> Dict[str, Any]:
+    return {
+        'llm_model': Cfg.OPENAI_MODEL,
+        'stt_model': (st.session.get('input_audio_transcription') or {}).get('model'),
+        'tts_voice': st.session.get('voice'),
+        'seed': seed,
+        'temperature': 0.3,
+    }
+
+
+def _build_replay_timeline(
+    transcript: Dict[str, Any],
+    *,
+    seed_override: Optional[int] = None,
+    session_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    base_seed = transcript.get('seed') or 0
+    effective_seed = base_seed if seed_override is None else seed_override
+    rng = random.Random(effective_seed)
+    session_config = dict(transcript.get('session_config') or {})
+    if session_override:
+        session_config.update(session_override)
+
+    events: List[Dict[str, Any]] = []
+    for idx, item in enumerate(transcript.get('items') or []):
+        events.append(
+            {
+                'order': idx,
+                'item_id': item.get('id'),
+                'role': item.get('role'),
+                'type': item.get('type'),
+                'text': _extract_text_from_parts(item.get('content') or []),
+                'delay_ms': 120 + rng.randint(0, 240),
+            }
+        )
+
+    return {
+        'session_id': transcript.get('session_id'),
+        'seed': effective_seed,
+        'session': session_config,
+        'feedback': transcript.get('feedback'),
+        'model_params': transcript.get('model_params'),
+        'events': events,
+    }
+
+
 @app.websocket('/v1/realtime')
 async def realtime_ws_endpoint(websocket: WebSocket):
     if not _ws_auth_ok_fastapi(websocket):
@@ -525,6 +738,9 @@ async def realtime_ws_endpoint(websocket: WebSocket):
     loop = asyncio.get_running_loop()
     send_lock = asyncio.Lock()
     st = WSConv()
+
+    seed_param = websocket.query_params.get('seed')
+    session_seed = _coerce_int(seed_param, random.randint(1_000, 999_999), minimum=0)
 
     async def send_async(obj):
         """Async sender for the main event loop."""
@@ -541,6 +757,7 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                 log(f"[IO][WS][SEND][THREAD_ERROR] {e}")
         future.add_done_callback(log_exception)
 
+    st.session.setdefault('seed', session_seed)
     st.session.setdefault('sr', REALTIME_SR)
     st.session.setdefault('turn_detection', {'type': 'none'})
 
@@ -765,6 +982,9 @@ async def realtime_ws_endpoint(websocket: WebSocket):
                         td.setdefault('interrupt_response', vad_state['interrupt_response'])
                 session_payload = _session_payload(sess_id, st.session)
                 await send_async({'type': 'session.updated', 'session': session_payload})
+            elif t == 'session.feedback':
+                st.session['feedback'] = d.get('feedback')
+                await send_async({'type': 'session.feedback.stored', 'feedback': st.session.get('feedback')})
             elif t == 'input_audio_buffer.append':
                 try: chunk = base64.b64decode(d.get('audio') or '')
                 except Exception: await send_async(openai_error('bad audio base64', 'client_error', None, 400)); continue
@@ -846,6 +1066,17 @@ async def realtime_ws_endpoint(websocket: WebSocket):
     except Exception as e:
         log(f'[REALTIME][WS] an error occurred in main loop: {e}', exc_info=True)
     finally:
+        try:
+            _store_transcript(
+                session_id=sess_id,
+                seed=session_seed,
+                session_config=st.session,
+                items=st.items,
+                feedback=st.session.get('feedback'),
+                model_params=_model_params_snapshot(st, session_seed),
+            )
+        except Exception as exc:
+            log(f"[TRANSCRIPTS] failed to persist session {sess_id}: {exc}")
         log(f'[REALTIME][WS] connection closed for {websocket.client}')
 
 
