@@ -54,13 +54,23 @@ INFLIGHT_REQUESTS = Gauge(
 FEEDBACK_COUNTER = Counter(
     "feedback_submissions_total",
     "Total number of feedback submissions by label",
-    ["label"],
+    ["label", "channel"],
 )
 FEEDBACK_LATENCY = Histogram(
     "feedback_submission_latency_seconds",
     "Latency of feedback submissions by label",
-    ["label"],
+    ["label", "channel"],
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5),
+)
+FEEDBACK_SCORE_SUM = Counter(
+    "feedback_score_sum",
+    "Cumulative sum of numeric feedback scores by channel",
+    ["channel"],
+)
+FEEDBACK_SCORE_COUNT = Counter(
+    "feedback_score_count",
+    "Number of feedback submissions that included a numeric score by channel",
+    ["channel"],
 )
 
 
@@ -143,10 +153,16 @@ def record_model_inference(duration_seconds: float, model: Optional[str]) -> Non
     MODEL_DURATION.labels(model=model or "unknown").observe(duration_seconds)
 
 
-def record_feedback_submission(label: str, duration_seconds: float) -> None:
+def record_feedback_submission(
+    label: str, duration_seconds: float, *, score: Optional[float] = None, channel: str = "default"
+) -> None:
     safe_label = label or "unknown"
-    FEEDBACK_COUNTER.labels(label=safe_label).inc()
-    FEEDBACK_LATENCY.labels(label=safe_label).observe(duration_seconds)
+    safe_channel = channel or "default"
+    FEEDBACK_COUNTER.labels(label=safe_label, channel=safe_channel).inc()
+    FEEDBACK_LATENCY.labels(label=safe_label, channel=safe_channel).observe(duration_seconds)
+    if score is not None:
+        FEEDBACK_SCORE_SUM.labels(channel=safe_channel).inc(score)
+        FEEDBACK_SCORE_COUNT.labels(channel=safe_channel).inc()
 
 
 def _build_request_log_fields(
