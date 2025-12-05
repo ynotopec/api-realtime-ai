@@ -21,6 +21,8 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, stat
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
+from chat_completions import router as chat_router
+
 # ────────────────────────────── Config & logging ──────────────────────────────
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s – %(message)s')
 logger = logging.getLogger(__name__)
@@ -434,6 +436,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(chat_router)
 
 
 # ────────────────────────────── Transcript API ──────────────────────

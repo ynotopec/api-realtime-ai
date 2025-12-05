@@ -59,6 +59,8 @@ Browser mic (24k PCM)  ──► FastAPI WebSocket (/v1/realtime)
   * Streams text deltas and PCM24k audio chunks back to the client.
   * Supports response cancellation and auto-response generation triggered by VAD.
 * **Token gate** for realtime endpoints via `API_TOKENS`.
+* **OpenAI-compatible REST chat** at `/v1/chat/completions` with SSE streaming and group channels.
+* **Feedback endpoints** (`/v1/feedback*`) that feed a self-improvement loop to tune prompts/model routing.
 * **Transcript storage & replay** via `/api/transcripts/*` endpoints and a small UI at `/ui/transcripts`.
 
 ---
@@ -110,6 +112,10 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 
 > Alternatively run `python app.py` which bootstraps `uvicorn` with the same defaults.
 
+### 3) GPU-friendly virtualenv setup
+
+See [docs/gpu-setup.md](docs/gpu-setup.md) for a step-by-step recipe that installs CUDA-enabled `torch`, configures
+chat defaults, and exercises the OpenAI-compatible endpoints inside a Python 3.11 virtual environment.
 ### 3) Frontend chat UI (React + Vite)
 
 ```bash
@@ -199,6 +205,18 @@ Server-side VAD is opt-in (via `session.update`), but the defaults above help ke
 * `error`: `{ error: { message: "..." } }`
 
 > ℹ️  See [docs/realtime-protocol-diff.md](docs/realtime-protocol-diff.md) for a summary of the known gaps with the latest OpenAI Realtime protocol (renamed events, additional fields, parallel responses, etc.).
+
+---
+
+## REST chat completions + feedback loop
+
+* **Endpoint**: `/v1/chat/completions` mirrors OpenAI's schema, accepts `stream: true`, and emits `data: ...` SSE chunks ending with `[DONE]`.
+* **Group channels**: set `channel` on the request to maintain shared history and route tuning separately per team/room.
+* **Feedback hooks**:
+  * `POST /v1/feedback` → store positive/negative votes alongside the prompt/response.
+  * `GET /v1/feedback/summary` → returns aggregate counts for a channel.
+  * `GET /v1/feedback/recent` → retrieve the latest feedback rows.
+* **Self-improvement**: the chat endpoint reads channel feedback to auto-adjust system prompts and route to a fallback model when negative signals dominate.
 
 ---
 

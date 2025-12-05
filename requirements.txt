@@ -4,6 +4,7 @@ uvicorn[standard]
 
 # External API Communication
 requests
+httpx
 
 # Audio Processing
 numpy
@@ -12,3 +13,6 @@ webrtcvad
 # WebSocket implementation is included in uvicorn[standard]
 # or can be listed explicitly:
 websockets
+
+# Optional GPU-capable model runtime
+torch
