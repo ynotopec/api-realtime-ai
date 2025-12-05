@@ -1,0 +1,59 @@
+image:
+  repository: ghcr.io/your-org/api-realtime-ai
+  tag: "prod"
+  pullPolicy: IfNotPresent
+
+gpu:
+  enabled: true
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: Exists
+      effect: NoSchedule
+  runtimeClassName: nvidia
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 1
+    memory: 2Gi
+    nvidia.com/gpu: 1
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 75
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: realtime.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: realtime-tls
+      hosts:
+        - realtime.example.com
+
+secrets:
+  openaiApiKey: "${OPENAI_API_KEY}"
+  sttApiKey: "${STT_API_KEY}"
+  ttsApiKey: "${TTS_API_KEY}"
+  apiTokens: "${API_TOKENS}"
+
+env:
+  config:
+    openaiApiModel: "gpt-4o-realtime"
+    ttsApiUrl: "https://tts.prod.example.com"
+    openaiApiBase: "https://api.openai.com/v1"
+    sttApiBase: "https://stt.prod.example.com"
+
+nodeSelector:
+  environment: prod
