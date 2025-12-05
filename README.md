@@ -98,7 +98,7 @@ export STT_API_KEY=...            # Optional override OPENAI_API_KEY
 export STT_API_BASE=...           # Optional override OPENAI_API_BASE
 export TTS_API_KEY=...            # Optional override OPENAI_API_KEY
 export TTS_API_URL=...            # Optional override OPENAI_API_BASE
-export API_TOKENS=...             # optional auth for realtime WebSocket override OPENAI_API_KEY
+export API_TOKENS=...             # optional auth tokens for the realtime WebSocket (comma-separated)
 export SERVER_NAME=0.0.0.0        # optional host binding
 export SERVER_PORT=8080           # optional port binding
 ```
@@ -116,7 +116,7 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 
 See [docs/gpu-setup.md](docs/gpu-setup.md) for a step-by-step recipe that installs CUDA-enabled `torch`, configures
 chat defaults, and exercises the OpenAI-compatible endpoints inside a Python 3.11 virtual environment.
-### 3) Frontend chat UI (React + Vite)
+### 4) Frontend chat UI (React + Vite)
 
 ```bash
 cd web
@@ -297,7 +297,7 @@ asyncio.run(main())
 ## Troubleshooting
 
 * **No audio output**: verify TTS credentials and upstream service health.
-* **Whisper errors**: check `TTS_API_KEY`, `STT_API_BASE`, and upstream service health.
+* **Whisper errors**: check `STT_API_KEY`, `STT_API_BASE`, and upstream service health.
 * **`ffmpeg` not found**: install it and ensure it’s on `$PATH` inside your runtime.
 * **High latency**: tune VAD (`start_ms`, `end_ms`, `pad_ms`, `max_ms`) and reduce TTS chunk size.
 * **WebSocket closes immediately**: missing/invalid token with `API_TOKENS` set.
