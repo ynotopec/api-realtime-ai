@@ -84,11 +84,19 @@ def configure_logging() -> None:
     _logging_configured = True
 
 
-def configure_tracing(service_name: str = "api-realtime-ai") -> None:
+def _service_name() -> str:
+    return os.getenv("OTEL_SERVICE_NAME", "api-realtime-ai")
+
+
+def configure_tracing(service_name: Optional[str] = None) -> None:
     global _tracing_configured
     if _tracing_configured:
         return
-    sampling_ratio = float(os.getenv("OTEL_TRACES_SAMPLER_RATIO", "1.0"))
+    service_name = service_name or _service_name()
+    try:
+        sampling_ratio = float(os.getenv("OTEL_TRACES_SAMPLER_RATIO", "1.0"))
+    except ValueError:
+        sampling_ratio = 1.0
     resource = Resource.create({"service.name": service_name})
     provider = TracerProvider(resource=resource, sampler=TraceIdRatioBased(sampling_ratio))
     otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
@@ -98,10 +106,11 @@ def configure_tracing(service_name: str = "api-realtime-ai") -> None:
     _tracing_configured = True
 
 
-def configure_metrics(service_name: str = "api-realtime-ai") -> None:
+def configure_metrics(service_name: Optional[str] = None) -> None:
     global _metrics_configured
     if _metrics_configured:
         return
+    service_name = service_name or _service_name()
     resource = Resource.create({"service.name": service_name})
     otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
     metric_exporter = OTLPMetricExporter(endpoint=f"{otlp_endpoint.rstrip('/')}/v1/metrics")
@@ -160,8 +169,13 @@ def add_observability(app: FastAPI) -> None:
         start = time.perf_counter()
         INFLIGHT_REQUESTS.inc()
         with tracer.start_as_current_span(
-            "http.request", attributes={"http.method": request.method, "http.target": request.url.path}
-        ):
+            "http.request",
+            attributes={
+                "http.method": request.method,
+                "http.target": request.url.path,
+                "service.name": _service_name(),
+            },
+        ) as span:
             response: Optional[Response] = None
             try:
                 response = await call_next(request)
@@ -176,6 +190,10 @@ def add_observability(app: FastAPI) -> None:
                 INFLIGHT_REQUESTS.dec()
                 if response is not None:
                     response.headers["x-request-id"] = request_id
+                    if span is not None:
+                        ctx = span.get_span_context()
+                        if ctx.is_valid:
+                            response.headers["x-trace-id"] = format(ctx.trace_id, "032x")
 
     FastAPIInstrumentor.instrument_app(app, tracer_provider=trace.get_tracer_provider())
 
