@@ -182,7 +182,8 @@ Server-side VAD is opt-in (via `session.update`), but the defaults above help ke
 
 * **Structured logs**: requests are logged as JSON with request ID, trace/span IDs, path, method, status, latency, and optional user/model/token metadata. `x-request-id` and `x-trace-id` are echoed on responses to aid correlation. Override verbosity via `LOG_LEVEL`.
 * **Tracing**: OpenTelemetry tracer/meter providers are configured on startup. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to point at your collector (default `http://localhost:4318`), and tune sampling with `OTEL_TRACES_SAMPLER_RATIO`.
-* **Metrics**: Prometheus metrics are exposed at `/metrics` (request counters/latency, token throughput, model inference durations, and in-flight requests). Scrape this endpoint directly or forward via your collector.
+* **Metrics**: Prometheus metrics are exposed at `/metrics` (request counters/latency, token throughput, model inference durations, feedback counts/ratings, and in-flight requests). Scrape this endpoint directly or forward via your collector.
+* **Dashboards & alerts**: Import `docs/grafana/realtime-observability.json` into Grafana and load `docs/prometheus-alerts.yaml` into Prometheus/Grafana Alerting. See [`docs/observability-dashboards.md`](docs/observability-dashboards.md) for provisioning steps and environment-specific threshold guidance.
 
 ---
 

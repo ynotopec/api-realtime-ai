@@ -436,7 +436,12 @@ async def submit_feedback(fb: FeedbackIn, request: Request):
         )
 
     duration = time.perf_counter() - start
-    record_feedback_submission(derived_label, duration)
+    record_feedback_submission(
+        derived_label,
+        duration,
+        score=fb.score,
+        channel=fb.channel,
+    )
     return {"id": feedback_id, "channel": fb.channel, "label": derived_label}
 
 

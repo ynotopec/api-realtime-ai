@@ -1,0 +1,61 @@
+groups:
+  - name: api-realtime-ai.rules
+    rules:
+      - alert: ApiHighLatencyP99
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(api_request_latency_seconds_bucket{job=~"$job"}[5m])))
+            > 1
+        for: 10m
+        labels:
+          severity: page
+          service: api-realtime-ai
+        annotations:
+          summary: "High p99 latency for realtime API"
+          description: "p99 latency exceeded 1s for 10m. Adjust threshold per env via values.yaml or PrometheusRule overrides."
+
+      - alert: ApiErrorRateHigh
+        expr: |
+          (sum(rate(api_requests_total{status!~"2..",job=~"$job"}[5m])) /
+          sum(rate(api_requests_total{job=~"$job"}[5m]))) > 0.05
+        for: 10m
+        labels:
+          severity: page
+          service: api-realtime-ai
+        annotations:
+          summary: "Elevated HTTP error rate"
+          description: "Non-2xx rate above 5% for 10m. Tune threshold per environment."
+
+      - alert: TokenThroughputAnomaly
+        expr: |
+          rate(api_token_usage_total{job=~"$job"}[5m])
+            < 0.5 * avg_over_time(rate(api_token_usage_total{job=~"$job"}[5m])[1h])
+        for: 15m
+        labels:
+          severity: ticket
+          service: api-realtime-ai
+        annotations:
+          summary: "Token throughput dropped vs 1h baseline"
+          description: "Sustained drop in token throughput compared to last hour. Check upstream models or traffic sources."
+
+      - alert: ModelCallDurationHigh
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(model_inference_duration_seconds_bucket{job=~"$job"}[5m]))) > 5
+        for: 10m
+        labels:
+          severity: ticket
+          service: api-realtime-ai
+        annotations:
+          summary: "Upstream model latency high"
+          description: "p95 model inference duration above 5s. Threshold can be relaxed in dev/staging."
+
+      - alert: PositiveFeedbackRateDrop
+        expr: |
+          (sum(rate(feedback_submissions_total{label="positive",job=~"$job"}[15m])) /
+          sum(rate(feedback_submissions_total{job=~"$job"}[15m]))) < 0.6
+        for: 15m
+        labels:
+          severity: ticket
+          service: api-realtime-ai
+        annotations:
+          summary: "Positive feedback rate degraded"
+          description: "Rolling positive rate below 60% for 15m. Adjust baseline for each environment."
