@@ -109,6 +109,16 @@ uvicorn app:app --host ${SERVER_NAME:-0.0.0.0} --port ${SERVER_PORT:-8080} --ws 
 
 > Alternatively run `python app.py` which bootstraps `uvicorn` with the same defaults.
 
+### 3) Frontend chat UI (React + Vite)
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+The UI streams markdown-formatted replies, displays message history with replay controls, and captures inline thumbs-up/down feedback. Environment variables in `web/.env.example` let you point dev/prod builds at different realtime base URLs or optional group channels.
+
 ---
 
 ## Configuration
