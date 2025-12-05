@@ -1,0 +1,6 @@
+apiVersion: v2
+name: realtime-bridge
+description: Helm chart for deploying the Realtime Speech Bridge FastAPI service
+version: 0.1.0
+appVersion: "0.1.0"
+type: application

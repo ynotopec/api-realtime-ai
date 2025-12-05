@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "realtime-bridge.fullname" . }}
+  labels:
+    {{- include "realtime-bridge.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "realtime-bridge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "realtime-bridge.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- if or .Values.serviceAccount.create .Values.serviceAccount.name }}
+      serviceAccountName: {{ include "realtime-bridge.serviceAccountName" . }}
+      {{- end }}
+      {{- if or .Values.gpu.enabled .Values.gpu.runtimeClassName }}
+      runtimeClassName: {{ default nil .Values.gpu.runtimeClassName | quote }}
+      {{- end }}
+      {{- if or (and .Values.nodeSelector (not (empty .Values.nodeSelector))) (and .Values.gpu.enabled (not (empty .Values.gpu.nodeSelector))) }}
+      nodeSelector:
+        {{- if .Values.nodeSelector }}
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+        {{- end }}
+        {{- if and .Values.gpu.enabled .Values.gpu.nodeSelector }}
+        {{- toYaml .Values.gpu.nodeSelector | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- if or (and .Values.tolerations (not (empty .Values.tolerations))) (and .Values.gpu.enabled (not (empty .Values.gpu.tolerations))) }}
+      tolerations:
+        {{- if .Values.tolerations }}
+        {{- toYaml .Values.tolerations | nindent 8 }}
+        {{- end }}
+        {{- if and .Values.gpu.enabled .Values.gpu.tolerations }}
+        {{- toYaml .Values.gpu.tolerations | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ include "realtime-bridge.name" . }}
+          image: "{{ ternary (printf "%s:%s" .Values.imageGpu.repository .Values.imageGpu.tag) (printf "%s:%s" .Values.image.repository .Values.image.tag) .Values.gpu.enabled }}"
+          imagePullPolicy: {{ ternary (default .Values.image.pullPolicy "IfNotPresent") (default .Values.imageGpu.pullPolicy "IfNotPresent") .Values.gpu.enabled }}
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: SERVER_NAME
+              value: {{ .Values.env.server.host | quote }}
+            - name: SERVER_PORT
+              value: {{ .Values.env.server.port | quote }}
+            - name: OPENAI_API_BASE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: OPENAI_API_BASE
+            - name: OPENAI_API_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: OPENAI_API_MODEL
+            - name: STT_API_BASE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: STT_API_BASE
+            - name: TTS_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: TTS_API_URL
+            - name: DEFAULT_VAD_START_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: DEFAULT_VAD_START_MS
+            - name: DEFAULT_VAD_END_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: DEFAULT_VAD_END_MS
+            - name: DEFAULT_VAD_PAD_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: DEFAULT_VAD_PAD_MS
+            - name: DEFAULT_VAD_MAX_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: DEFAULT_VAD_MAX_MS
+            - name: DEFAULT_VAD_MIN_VOICE_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: DEFAULT_VAD_MIN_VOICE_MS
+            - name: DEFAULT_VAD_AUTORESP
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-config
+                  key: DEFAULT_VAD_AUTORESP
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-secrets
+                  key: OPENAI_API_KEY
+            - name: STT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-secrets
+                  key: STT_API_KEY
+            - name: TTS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-secrets
+                  key: TTS_API_KEY
+            - name: API_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "realtime-bridge.fullname" . }}-secrets
+                  key: API_TOKENS
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
