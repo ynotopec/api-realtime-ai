@@ -51,6 +51,17 @@ INFLIGHT_REQUESTS = Gauge(
     "api_inflight_requests",
     "Current number of in-flight API requests",
 )
+FEEDBACK_COUNTER = Counter(
+    "feedback_submissions_total",
+    "Total number of feedback submissions by label",
+    ["label"],
+)
+FEEDBACK_LATENCY = Histogram(
+    "feedback_submission_latency_seconds",
+    "Latency of feedback submissions by label",
+    ["label"],
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5),
+)
 
 
 def configure_logging() -> None:
@@ -123,6 +134,12 @@ def record_model_inference(duration_seconds: float, model: Optional[str]) -> Non
     MODEL_DURATION.labels(model=model or "unknown").observe(duration_seconds)
 
 
+def record_feedback_submission(label: str, duration_seconds: float) -> None:
+    safe_label = label or "unknown"
+    FEEDBACK_COUNTER.labels(label=safe_label).inc()
+    FEEDBACK_LATENCY.labels(label=safe_label).observe(duration_seconds)
+
+
 def _build_request_log_fields(
     request: Request,
     response_status: int,
@@ -189,4 +206,5 @@ __all__ = [
     "inject_tracing_headers",
     "record_token_usage",
     "record_model_inference",
+    "record_feedback_submission",
 ]

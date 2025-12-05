@@ -1,5 +1,6 @@
 """Chat completion + feedback endpoints with self-improvement loop."""
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -8,11 +9,19 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
-from observability import inject_tracing_headers, record_model_inference, record_token_usage
+from opentelemetry import trace
+from observability import (
+    inject_tracing_headers,
+    record_feedback_submission,
+    record_model_inference,
+    record_token_usage,
+)
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path(os.getenv("FEEDBACK_DB", "data/feedback.db"))
 DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -45,6 +54,30 @@ class FeedbackIn(BaseModel):
     message: str
     response: Optional[str] = None
     positive: bool
+    label: Optional[Literal["positive", "negative", "neutral"]] = Field(
+        default=None, description="Normalized user sentiment label"
+    )
+    score: Optional[float] = Field(
+        default=None, description="Optional numeric score or rating"
+    )
+    request_id: Optional[str] = Field(
+        default=None,
+        description="ID that ties feedback to the originating request",
+        min_length=1,
+    )
+    trace_id: Optional[str] = Field(
+        default=None,
+        description="Trace identifier to join with distributed traces",
+        min_length=1,
+    )
+    prompt: Optional[str] = None
+    model_version: Optional[str] = Field(
+        default=None, description="Model or routing decision used for the response"
+    )
+    routing_metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Arbitrary routing/decision metadata recorded for observability",
+    )
     tags: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -72,31 +105,78 @@ class FeedbackStore:
                     message TEXT NOT NULL,
                     response TEXT,
                     positive INTEGER NOT NULL,
+                    label TEXT,
+                    score REAL,
+                    request_id TEXT,
+                    trace_id TEXT,
+                    prompt TEXT,
+                    model_version TEXT,
+                    routing_metadata TEXT,
                     tags TEXT,
                     metadata TEXT,
                     created_at REAL NOT NULL
                 )
                 """
             )
+            self._ensure_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        """Ensure newly added columns exist for older databases."""
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
+        migrations = {
+            "label": "ALTER TABLE feedback ADD COLUMN label TEXT",
+            "score": "ALTER TABLE feedback ADD COLUMN score REAL",
+            "request_id": "ALTER TABLE feedback ADD COLUMN request_id TEXT",
+            "trace_id": "ALTER TABLE feedback ADD COLUMN trace_id TEXT",
+            "prompt": "ALTER TABLE feedback ADD COLUMN prompt TEXT",
+            "model_version": "ALTER TABLE feedback ADD COLUMN model_version TEXT",
+            "routing_metadata": "ALTER TABLE feedback ADD COLUMN routing_metadata TEXT",
+        }
+        for column, ddl in migrations.items():
+            if column not in existing:
+                conn.execute(ddl)
+
     def insert(self, fb: FeedbackIn) -> int:
         payload = fb.model_dump()
+        label = payload.get("label") or ("positive" if payload["positive"] else "negative")
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO feedback (channel, message, response, positive, tags, metadata, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO feedback (
+                    channel,
+                    message,
+                    response,
+                    positive,
+                    label,
+                    score,
+                    request_id,
+                    trace_id,
+                    prompt,
+                    model_version,
+                    routing_metadata,
+                    tags,
+                    metadata,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["channel"],
                     payload["message"],
                     payload.get("response"),
                     1 if payload["positive"] else 0,
+                    label,
+                    payload.get("score"),
+                    payload.get("request_id"),
+                    payload.get("trace_id"),
+                    payload.get("prompt"),
+                    payload.get("model_version"),
+                    json.dumps(payload.get("routing_metadata")),
                     json.dumps(payload.get("tags")),
                     json.dumps(payload.get("metadata")),
                     time.time(),
@@ -309,9 +389,55 @@ async def chat_completions(request: ChatCompletionRequest):
 
 
 @router.post("/feedback", response_model=Dict[str, Any])
-async def submit_feedback(fb: FeedbackIn):
-    feedback_id = await run_in_threadpool(feedback_store.insert, fb)
-    return {"id": feedback_id, "channel": fb.channel}
+async def submit_feedback(fb: FeedbackIn, request: Request):
+    start = time.perf_counter()
+    derived_label = fb.label or ("positive" if fb.positive else "negative")
+    span = trace.get_current_span()
+    span_ctx = span.get_span_context()
+    trace_id = fb.trace_id or (
+        format(span_ctx.trace_id, "032x") if span_ctx and span_ctx.is_valid else None
+    )
+    request_id = fb.request_id or request.headers.get("x-request-id")
+
+    if not request_id and not trace_id:
+        raise HTTPException(
+            status_code=400,
+            detail="feedback must include a request_id or be submitted within a traced request",
+        )
+
+    enriched_fb = fb.model_copy(
+        update={"label": derived_label, "trace_id": trace_id, "request_id": request_id}
+    )
+    feedback_id = await run_in_threadpool(feedback_store.insert, enriched_fb)
+
+    log_fields = {
+        "event": "feedback.submitted",
+        "feedback_id": feedback_id,
+        "label": derived_label,
+        "channel": fb.channel,
+        "trace_id": trace_id,
+        "request_id": request_id,
+        "model_version": fb.model_version,
+    }
+    logger.info("feedback.submitted", extra=log_fields)
+
+    if span.is_recording():
+        span.add_event(
+            "feedback.submitted",
+            attributes={
+                "feedback.id": feedback_id,
+                "feedback.label": derived_label,
+                "feedback.score": fb.score if fb.score is not None else 0,
+                "feedback.channel": fb.channel,
+                "feedback.request_id": request_id or "",
+                "feedback.trace_id": trace_id or "",
+                "feedback.model_version": fb.model_version or "",
+            },
+        )
+
+    duration = time.perf_counter() - start
+    record_feedback_submission(derived_label, duration)
+    return {"id": feedback_id, "channel": fb.channel, "label": derived_label}
 
 
 @router.get("/feedback/summary", response_model=FeedbackSummary)
