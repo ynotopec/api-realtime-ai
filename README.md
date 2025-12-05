@@ -153,6 +153,9 @@ The UI streams markdown-formatted replies, displays message history with replay 
 | `API_TOKENS`        | ❌                        | –                                                                   | Comma-separated tokens to allow access to realtime endpoint. Empty = no auth.  |
 | `SERVER_NAME`       | ❌                        | `0.0.0.0`                                                           | Bind address for the FastAPI/uvicorn server.                                   |
 | `SERVER_PORT`       | ❌                        | `8080`                                                              | Bind port for the FastAPI/uvicorn server.                                      |
+| `LOG_LEVEL`         | ❌                        | `INFO`                                                              | Log level used by the JSON logger.                                             |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | ❌             | `http://localhost:4318`                                             | OTLP endpoint for traces/metrics (HTTP/protobuf).                              |
+| `OTEL_TRACES_SAMPLER_RATIO` | ❌                | `1.0`                                                               | Trace sampling ratio (0.0–1.0).                                                |
 
 ### VAD tuning defaults
 
@@ -173,6 +176,12 @@ Server-side VAD is opt-in (via `session.update`), but the defaults above help ke
   * `POST /api/transcripts/{session_id}/replay` – rebuild a deterministic replay timeline (optional `seed` override).
   * `POST /api/transcripts/{session_id}/feedback` – attach structured or free-form feedback.
 * A lightweight browser UI is available at `/ui/transcripts` for selecting and replaying saved sessions.
+
+### Observability & instrumentation
+
+* **Structured logs**: requests are logged as JSON with request ID, trace/span IDs, path, method, status, latency, and optional user/model/token metadata. Override verbosity via `LOG_LEVEL`.
+* **Tracing**: OpenTelemetry tracer/meter providers are configured on startup. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to point at your collector (default `http://localhost:4318`), and tune sampling with `OTEL_TRACES_SAMPLER_RATIO`.
+* **Metrics**: Prometheus metrics are exposed at `/metrics` (request counters/latency, token throughput, model inference durations, and in-flight requests). Scrape this endpoint directly or forward via your collector.
 
 ---
 

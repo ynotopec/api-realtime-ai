@@ -22,9 +22,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from chat_completions import router as chat_router
+from observability import add_observability
 
 # ────────────────────────────── Config & logging ──────────────────────────────
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s – %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -429,6 +429,7 @@ def _pcm24k_to_webm_for_whisper(pcm: bytes) -> str:
 
 # ────────────────────────────── FastAPI App ──────────────────────────────
 app = FastAPI()
+add_observability(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
