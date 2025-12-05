@@ -41,6 +41,21 @@ TOKEN_COUNTER = Counter(
     "Number of tokens processed",
     ["direction", "model"],
 )
+FEEDBACK_COUNTER = Counter(
+    "feedback_events_total",
+    "Feedback submissions by outcome and channel",
+    ["channel", "outcome"],
+)
+FEEDBACK_SCORE_SUM = Counter(
+    "feedback_score_sum",
+    "Cumulative feedback score for calculating averages",
+    ["channel"],
+)
+FEEDBACK_SCORE_COUNT = Counter(
+    "feedback_score_count",
+    "Number of feedback scores recorded",
+    ["channel"],
+)
 MODEL_DURATION = Histogram(
     "model_inference_duration_seconds",
     "Duration of upstream model inference calls",
@@ -123,6 +138,15 @@ def record_model_inference(duration_seconds: float, model: Optional[str]) -> Non
     MODEL_DURATION.labels(model=model or "unknown").observe(duration_seconds)
 
 
+def record_feedback(channel: str, positive: bool, rating: Optional[float] = None) -> None:
+    outcome = "positive" if positive else "negative"
+    FEEDBACK_COUNTER.labels(channel=channel, outcome=outcome).inc()
+
+    score = rating if rating is not None else (1 if positive else 0)
+    FEEDBACK_SCORE_SUM.labels(channel=channel).inc(score)
+    FEEDBACK_SCORE_COUNT.labels(channel=channel).inc()
+
+
 def _build_request_log_fields(
     request: Request,
     response_status: int,
@@ -189,4 +213,5 @@ __all__ = [
     "inject_tracing_headers",
     "record_token_usage",
     "record_model_inference",
+    "record_feedback",
 ]

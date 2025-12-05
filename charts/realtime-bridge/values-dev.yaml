@@ -40,5 +40,25 @@ env:
     openaiApiModel: "gpt-4o-realtime"
     ttsApiUrl: "https://tts.dev.example.com"
 
+monitoring:
+  alerts:
+    enabled: true
+    latency:
+      window: 5m
+      p99Seconds: 2.5
+      for: 5m
+    errorRate:
+      window: 5m
+      threshold: 0.1
+      for: 5m
+    tokenThroughput:
+      window: 10m
+      minTokensPerSec: 1
+      for: 10m
+    feedbackPositiveRate:
+      window: 15m
+      minRate: 0.6
+      for: 10m
+
 nodeSelector:
   environment: dev

@@ -1,0 +1,165 @@
+{
+  "id": null,
+  "uid": "realtime-observability",
+  "title": "Realtime API Observability",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": ["realtime", "api", "prometheus"],
+  "timezone": "",
+  "time": {"from": "now-6h", "to": "now"},
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "channel",
+        "type": "textbox",
+        "label": "Channel",
+        "query": "default",
+        "current": {"text": "default", "value": "default"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Request latency percentiles (p50/p90/p99)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le)(rate(api_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le)(rate(api_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p90"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le)(rate(api_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Token throughput (tokens/sec)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (direction, model)(rate(api_token_usage_total[5m]))",
+          "legendFormat": "{{direction}} — {{model}}"
+        }
+      ],
+      "options": {"legend": {"displayMode": "table", "placement": "right"}}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Model call durations (p50/p95/p99)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (model, le)(rate(model_inference_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (model, le)(rate(model_inference_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (model, le)(rate(model_inference_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99 {{model}}"
+        }
+      ],
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Positive feedback rate (rolling)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "sum(rate(feedback_events_total{outcome=\"positive\",channel=~\"$channel\"}[15m])) / sum(rate(feedback_events_total{channel=~\"$channel\"}[15m]))",
+          "legendFormat": "positive_rate"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": ""}, "orientation": "horizontal"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []}
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Average feedback rating",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 8},
+      "targets": [
+        {
+          "expr": "sum(rate(feedback_score_sum{channel=~\"$channel\"}[15m])) / sum(rate(feedback_score_count{channel=~\"$channel\"}[15m]))",
+          "legendFormat": "avg_rating"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": ""}},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Top errors by route/status",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [
+        {
+          "expr": "topk(5, sum(rate(api_requests_total{status=~\"5..\"}[5m])) by (path, status))",
+          "legendFormat": "{{path}} {{status}}"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "include": [
+              {"matcher": {"id": "byName", "options": "Time"}},
+              {"matcher": {"id": "byName", "options": "Value"}},
+              {"matcher": {"id": "byName", "options": "path"}},
+              {"matcher": {"id": "byName", "options": "status"}}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Slowest endpoints (p99 latency)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "targets": [
+        {
+          "expr": "topk(5, histogram_quantile(0.99, sum by (path, le)(rate(api_request_latency_seconds_bucket[5m]))))",
+          "legendFormat": "{{path}}"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "include": [
+              {"matcher": {"id": "byName", "options": "Time"}},
+              {"matcher": {"id": "byName", "options": "Value"}},
+              {"matcher": {"id": "byName", "options": "path"}}
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

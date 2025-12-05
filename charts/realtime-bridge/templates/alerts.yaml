@@ -1,0 +1,52 @@
+{{- if .Values.monitoring.alerts.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "realtime-bridge.fullname" . }}-alerts
+  labels:
+    app.kubernetes.io/name: {{ include "realtime-bridge.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: monitoring
+spec:
+  groups:
+    - name: realtime-api-latency
+      rules:
+        - alert: HighRequestLatencyP99
+          expr: histogram_quantile(0.99, sum by (le)(rate(api_request_latency_seconds_bucket[{{ .Values.monitoring.alerts.latency.window }}]))) > {{ .Values.monitoring.alerts.latency.p99Seconds }}
+          for: {{ .Values.monitoring.alerts.latency.for }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "High p99 request latency"
+            description: "p99 latency above {{ .Values.monitoring.alerts.latency.p99Seconds }}s for {{ .Values.monitoring.alerts.latency.window }}"
+    - name: realtime-api-errors
+      rules:
+        - alert: ElevatedErrorRate
+          expr: sum(rate(api_requests_total{status=~\"5..\"}[{{ .Values.monitoring.alerts.errorRate.window }}])) / sum(rate(api_requests_total[{{ .Values.monitoring.alerts.errorRate.window }}])) > {{ .Values.monitoring.alerts.errorRate.threshold }}
+          for: {{ .Values.monitoring.alerts.errorRate.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Elevated 5xx error rate"
+            description: "Error ratio exceeded {{ .Values.monitoring.alerts.errorRate.threshold }} over {{ .Values.monitoring.alerts.errorRate.window }}"
+    - name: realtime-api-throughput
+      rules:
+        - alert: TokenThroughputAnomaly
+          expr: sum(rate(api_token_usage_total[{{ .Values.monitoring.alerts.tokenThroughput.window }}])) < {{ .Values.monitoring.alerts.tokenThroughput.minTokensPerSec }}
+          for: {{ .Values.monitoring.alerts.tokenThroughput.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Token throughput dropped"
+            description: "Tokens/sec below {{ .Values.monitoring.alerts.tokenThroughput.minTokensPerSec }} for {{ .Values.monitoring.alerts.tokenThroughput.window }}"
+    - name: realtime-feedback-quality
+      rules:
+        - alert: FeedbackPositiveRateDrop
+          expr: sum(rate(feedback_events_total{outcome=\"positive\"}[{{ .Values.monitoring.alerts.feedbackPositiveRate.window }}])) / sum(rate(feedback_events_total[{{ .Values.monitoring.alerts.feedbackPositiveRate.window }}])) < {{ .Values.monitoring.alerts.feedbackPositiveRate.minRate }}
+          for: {{ .Values.monitoring.alerts.feedbackPositiveRate.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Positive feedback ratio dropped"
+            description: "Positive feedback below {{ .Values.monitoring.alerts.feedbackPositiveRate.minRate }} for {{ .Values.monitoring.alerts.feedbackPositiveRate.window }}"
+{{- end }}

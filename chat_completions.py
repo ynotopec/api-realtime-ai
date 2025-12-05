@@ -12,7 +12,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
-from observability import inject_tracing_headers, record_model_inference, record_token_usage
+from observability import (
+    inject_tracing_headers,
+    record_feedback,
+    record_model_inference,
+    record_token_usage,
+)
 
 DEFAULT_DB_PATH = Path(os.getenv("FEEDBACK_DB", "data/feedback.db"))
 DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -45,6 +50,12 @@ class FeedbackIn(BaseModel):
     message: str
     response: Optional[str] = None
     positive: bool
+    rating: Optional[float] = Field(
+        default=None,
+        description="Optional numeric rating (e.g., 1-5) to enrich feedback quality signals",
+        ge=0,
+        le=5,
+    )
     tags: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -72,12 +83,19 @@ class FeedbackStore:
                     message TEXT NOT NULL,
                     response TEXT,
                     positive INTEGER NOT NULL,
+                    rating REAL,
                     tags TEXT,
                     metadata TEXT,
                     created_at REAL NOT NULL
                 )
                 """
             )
+            self._ensure_rating_column(conn)
+
+    def _ensure_rating_column(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(feedback)")}
+        if "rating" not in columns:
+            conn.execute("ALTER TABLE feedback ADD COLUMN rating REAL")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -89,14 +107,15 @@ class FeedbackStore:
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO feedback (channel, message, response, positive, tags, metadata, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO feedback (channel, message, response, positive, rating, tags, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["channel"],
                     payload["message"],
                     payload.get("response"),
                     1 if payload["positive"] else 0,
+                    payload.get("rating"),
                     json.dumps(payload.get("tags")),
                     json.dumps(payload.get("metadata")),
                     time.time(),
@@ -311,6 +330,7 @@ async def chat_completions(request: ChatCompletionRequest):
 @router.post("/feedback", response_model=Dict[str, Any])
 async def submit_feedback(fb: FeedbackIn):
     feedback_id = await run_in_threadpool(feedback_store.insert, fb)
+    record_feedback(channel=fb.channel, positive=fb.positive, rating=fb.rating)
     return {"id": feedback_id, "channel": fb.channel}
 
 

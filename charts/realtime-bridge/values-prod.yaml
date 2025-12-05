@@ -55,5 +55,25 @@ env:
     openaiApiBase: "https://api.openai.com/v1"
     sttApiBase: "https://stt.prod.example.com"
 
+monitoring:
+  alerts:
+    enabled: true
+    latency:
+      window: 5m
+      p99Seconds: 1
+      for: 10m
+    errorRate:
+      window: 5m
+      threshold: 0.03
+      for: 10m
+    tokenThroughput:
+      window: 5m
+      minTokensPerSec: 10
+      for: 10m
+    feedbackPositiveRate:
+      window: 30m
+      minRate: 0.8
+      for: 20m
+
 nodeSelector:
   environment: prod

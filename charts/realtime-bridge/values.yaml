@@ -75,6 +75,26 @@ secrets:
   ttsApiKey: ""
   apiTokens: ""
 
+monitoring:
+  alerts:
+    enabled: true
+    latency:
+      window: 5m
+      p99Seconds: 1.5
+      for: 5m
+    errorRate:
+      window: 5m
+      threshold: 0.05
+      for: 10m
+    tokenThroughput:
+      window: 10m
+      minTokensPerSec: 5
+      for: 10m
+    feedbackPositiveRate:
+      window: 15m
+      minRate: 0.7
+      for: 15m
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
