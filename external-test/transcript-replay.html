@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Transcript explorer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { margin-top: 0; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    select, button, input { padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; }
+    button { cursor: pointer; }
+    #meta { margin-top: 12px; font-size: 14px; }
+    #timeline { list-style: decimal; padding-left: 24px; background: #f5f5f5; border-radius: 10px; margin-top: 12px; padding: 12px; color: #111; }
+    #transcript { white-space: pre-wrap; background: #111; color: #0f0; padding: 12px; border-radius: 10px; min-height: 140px; }
+    .event { margin-bottom: 8px; padding: 8px; border-radius: 8px; background: #fff; color: #111; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .event small { color: #555; display: block; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <h1>Transcript explorer</h1>
+  <div class="controls">
+    <button id="refreshBtn">Refresh list</button>
+    <select id="sessionSelect"></select>
+    <input id="seedInput" type="number" placeholder="Seed (optional)" />
+    <button id="replayBtn">Replay transcript</button>
+  </div>
+  <div id="meta">No session loaded yet.</div>
+  <h3>Transcript</h3>
+  <pre id="transcript">Select a session to load details.</pre>
+  <h3>Replay timeline</h3>
+  <ol id="timeline"></ol>
+
+  <script>
+    const sessionSelect = document.getElementById('sessionSelect');
+    const transcriptEl = document.getElementById('transcript');
+    const metaEl = document.getElementById('meta');
+    const timelineEl = document.getElementById('timeline');
+    const seedInput = document.getElementById('seedInput');
+    const refreshBtn = document.getElementById('refreshBtn');
+    const replayBtn = document.getElementById('replayBtn');
+
+    async function fetchJSON(url, options = {}) {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `Request failed (${res.status})`);
+      }
+      return res.json();
+    }
+
+    async function loadSessions() {
+      const data = await fetchJSON('/api/transcripts');
+      sessionSelect.innerHTML = '';
+      if (!data.transcripts || data.transcripts.length === 0) {
+        const opt = document.createElement('option');
+        opt.textContent = 'No transcripts yet';
+        opt.value = '';
+        sessionSelect.appendChild(opt);
+        return;
+      }
+      data.transcripts.forEach((row) => {
+        const opt = document.createElement('option');
+        opt.value = row.session_id;
+        const feedback = row.feedback ? ' (feedback saved)' : '';
+        opt.textContent = `${row.created_at} — ${row.session_id}${feedback}`;
+        sessionSelect.appendChild(opt);
+      });
+      if (data.transcripts[0]) {
+        sessionSelect.value = data.transcripts[0].session_id;
+        await loadTranscript(data.transcripts[0].session_id);
+      }
+    }
+
+    function renderTranscriptDetails(data) {
+      const sessionInfo = [
+        `Session: ${data.session_id}`,
+        `Created: ${data.created_at}`,
+        `Seed: ${data.seed}`,
+        `Voice: ${data.session?.voice || 'n/a'}`,
+        `LLM model: ${data.model_params?.llm_model || 'n/a'}`
+      ].join(' · ');
+      metaEl.textContent = sessionInfo;
+
+      const lines = [];
+      (data.items || []).forEach((item) => {
+        const text = (item.content || []).map((part) => part.text || part.transcript || '').join(' ');
+        lines.push(`[${item.role || item.type}] ${text}`);
+      });
+      if (data.feedback) {
+        lines.push('\nUser feedback:');
+        lines.push(JSON.stringify(data.feedback, null, 2));
+      }
+      transcriptEl.textContent = lines.join('\n');
+    }
+
+    async function loadTranscript(sessionId) {
+      if (!sessionId) return;
+      const data = await fetchJSON(`/api/transcripts/${sessionId}`);
+      renderTranscriptDetails(data);
+      timelineEl.innerHTML = '';
+    }
+
+    async function replayTranscript() {
+      const sessionId = sessionSelect.value;
+      if (!sessionId) return;
+      const body = {};
+      if (seedInput.value) body.seed = Number(seedInput.value);
+      const replay = await fetchJSON(`/api/transcripts/${sessionId}/replay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      timelineEl.innerHTML = '';
+      for (const event of replay.events) {
+        const li = document.createElement('li');
+        li.className = 'event';
+        const text = event.text || '(no text)';
+        li.innerHTML = `<strong>${event.role || event.type}</strong>: ${text}<small>delay: ${event.delay_ms}ms</small>`;
+        timelineEl.appendChild(li);
+        await new Promise((resolve) => setTimeout(resolve, event.delay_ms));
+      }
+    }
+
+    refreshBtn.addEventListener('click', loadSessions);
+    replayBtn.addEventListener('click', replayTranscript);
+    sessionSelect.addEventListener('change', (e) => loadTranscript(e.target.value));
+
+    loadSessions().catch((err) => {
+      metaEl.textContent = `Failed to load transcripts: ${err.message}`;
+    });
+  </script>
+</body>
+</html>

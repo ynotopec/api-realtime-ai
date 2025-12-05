@@ -59,6 +59,7 @@ Browser mic (24k PCM)  ──► FastAPI WebSocket (/v1/realtime)
   * Streams text deltas and PCM24k audio chunks back to the client.
   * Supports response cancellation and auto-response generation triggered by VAD.
 * **Token gate** for realtime endpoints via `API_TOKENS`.
+* **Transcript storage & replay** via `/api/transcripts/*` endpoints and a small UI at `/ui/transcripts`.
 
 ---
 
@@ -146,6 +147,16 @@ Server-side VAD is opt-in (via `session.update`), but the defaults above help ke
 * **Input** realtime: base64 **PCM16** at **24 kHz** (frame size = 20 ms, 960 bytes).
 * Whisper upload: `audio/webm` (Opus) is produced internally from PCM using `ffmpeg`.
 * TTS: external API returns WebM/Opus; helper converts to **PCM16 24 kHz** for streaming and **16 kHz** where needed.
+
+### Transcript storage & replay
+
+* Transcripts are persisted to SQLite at `TRANSCRIPTS_DB_PATH` (defaults to `transcripts.db` alongside `app.py`).
+* REST endpoints:
+  * `GET /api/transcripts` – list recorded sessions.
+  * `GET /api/transcripts/{session_id}` – fetch a full transcript blob (items, session config, metadata).
+  * `POST /api/transcripts/{session_id}/replay` – rebuild a deterministic replay timeline (optional `seed` override).
+  * `POST /api/transcripts/{session_id}/feedback` – attach structured or free-form feedback.
+* A lightweight browser UI is available at `/ui/transcripts` for selecting and replaying saved sessions.
 
 ---
 
