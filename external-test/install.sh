@@ -26,8 +26,19 @@ fi
 UV_PROJECT_ENVIRONMENT="$VENV_DIR" "$UV_BIN" sync --project "$SCRIPT_DIR"
 
 if [[ ! -f .env ]]; then
-  cp .env.example .env
-  echo "Created .env from .env.example"
+  if [[ -f .env.example ]]; then
+    cp .env.example .env
+    echo "Created .env from .env.example"
+  else
+    cat > .env <<'EOT'
+OPENAI_API_KEY=
+OPENAI_API_BASE=https://api.openai.com/v1
+HOST=127.0.0.1
+PORT=8000
+STATIC_PORT=5173
+EOT
+    echo "Created .env with defaults (no .env.example found)"
+  fi
 fi
 
 echo "Done. Virtual environment: $VENV_DIR"

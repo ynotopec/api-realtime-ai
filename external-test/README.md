@@ -16,6 +16,7 @@ Minimal realtime smoke-test setup with idempotent scripts.
 - `start.sh [IP] [PORT]` — start proxy + static server
 - `stop.sh` — stop both background processes
 - `upgrade.sh` — upgrade lock/dependencies with `uv`
+- `.env.example` — starter environment file copied to `.env` by `install.sh`
 
 ## Usage
 
