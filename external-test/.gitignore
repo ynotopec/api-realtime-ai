@@ -1,0 +1,10 @@
+# runtime
+.run/
+
+# local envs
+.venv/
+*.pyc
+__pycache__/
+
+# editor/system
+.DS_Store
