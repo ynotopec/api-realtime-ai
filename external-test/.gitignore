@@ -1,10 +1,16 @@
-# runtime
+# runtime / logs
 .run/
+*.log
 
-# local envs
+# local env and secrets
+.env
 .venv/
-*.pyc
-__pycache__/
 
-# editor/system
+# python cache
+__pycache__/
+*.py[cod]
+
+# editor / os
 .DS_Store
+.vscode/
+.idea/

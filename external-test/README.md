@@ -1,46 +1,37 @@
-# external-test (minimal + automated)
+# external-test
 
-Simple browser/CLI smoke tests for realtime behavior.
+Minimal realtime smoke-test setup with idempotent scripts.
 
-## One-time setup (idempotent)
+## What this setup gives you
+
+- `uv`-managed dependencies
+- virtual environment at `~/venv/<project-name>`
+- safe to rerun scripts (idempotent)
+- `.env.example` template
+- one-command start and upgrade
+
+## Files
+
+- `install.sh` — install `uv` (if needed), sync dependencies, create `.env` if missing
+- `start.sh [IP] [PORT]` — start proxy + static server
+- `stop.sh` — stop both background processes
+- `upgrade.sh` — upgrade lock/dependencies with `uv`
+
+## Usage
 
 ```bash
 cd external-test
-make install
-```
-
-What `make install` does:
-- creates `~/venv/external-test`
-- installs dependencies with `uv`
-- creates `.env` from `.env.example` if missing
-
-## Start services
-
-```bash
-make start                 # defaults: 127.0.0.1 8000 5173
-make start 0.0.0.0 8000    # optional IP/PORT override
-```
-
-This launches in background:
-- websocket bridge: `ws://<IP>:<PORT>/ws`
-- static test pages: `http://<IP>:5173`
-
-Pages:
-- `/index.html`
-- `/echo-cancel.html`
-- `/half-duplex.html`
-
-## Stop / status / upgrade
-
-```bash
-make status
-make stop
-make upgrade
+./install.sh
+./start.sh             # default: 127.0.0.1 8000
+./start.sh 0.0.0.0 9000
+./stop.sh
+./upgrade.sh
 ```
 
 ## Environment
 
-Edit `.env`:
+Copy `.env.example` to `.env` and set:
+
 - `OPENAI_API_KEY`
 - `OPENAI_API_BASE` (optional)
-- `HOST`, `PORT`, `STATIC_PORT`
+- `HOST` / `PORT` / `STATIC_PORT` (optional defaults)
