@@ -85,8 +85,7 @@ def _summarize_payload(payload: Any, *, limit: int = 200) -> str:
 class Cfg:
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
     OPENAI_API_BASE = os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1')
-    OPENAI_MODEL = os.getenv('OPENAI_API_MODEL', 'gemma3n')
-#gpt-oss')
+    OPENAI_MODEL = os.getenv('OPENAI_API_MODEL', 'mistralai/Voxtral-Mini-4B-Realtime-2602')
     STT_API_BASE = os.getenv('STT_API_BASE') or os.getenv('WHISPER_URL') or 'https://api.openai.com/v1'
     STT_API_KEY = os.getenv('STT_API_KEY') or OPENAI_API_KEY
     TTS_API_KEY = os.getenv('TTS_API_KEY') or os.getenv('AUDIO_API_KEY') or OPENAI_API_KEY

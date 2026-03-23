@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IP="${1:-}"
-PORT="${2:-}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_NAME="$(basename "$PROJECT_DIR")"
 VENV_DIR="${HOME}/venv/${PROJECT_NAME}"
@@ -17,18 +15,11 @@ uv venv "$VENV_DIR"
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 
-uv pip install --upgrade pip
-uv pip sync requirements.txt
+uv pip install --upgrade pip setuptools wheel
+uv pip install --upgrade --requirements requirements.txt
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
 fi
 
-set -a
-source .env
-set +a
-
-HOST="${IP:-${SERVER_NAME:-0.0.0.0}}"
-BIND_PORT="${PORT:-${SERVER_PORT:-8080}}"
-
-exec uv run --active python app.py --host "$HOST" --port "$BIND_PORT"
+echo "Upgrade complete. Virtualenv: $VENV_DIR"
