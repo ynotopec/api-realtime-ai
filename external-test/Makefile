@@ -24,8 +24,20 @@ help:
 
 install:
 	@mkdir -p "$(RUN_DIR)"
-	@command -v uv >/dev/null 2>&1 || python3 -m pip install --user uv
-	@UV_PROJECT_ENVIRONMENT="$(UV_PROJECT_ENVIRONMENT)" uv sync --project .
+	@if ! command -v uv >/dev/null 2>&1; then \
+		if python3 -m pip --version >/dev/null 2>&1; then \
+			python3 -m pip install --user uv; \
+		elif python3 -m ensurepip --upgrade --user >/dev/null 2>&1; then \
+			python3 -m pip install --user uv; \
+		elif command -v curl >/dev/null 2>&1; then \
+			curl -LsSf https://astral.sh/uv/install.sh | sh; \
+		else \
+			echo "Error: uv is missing and neither pip nor curl is available to install it."; \
+			exit 1; \
+		fi; \
+	fi
+	@UV_BIN="$$(command -v uv || echo "$$HOME/.local/bin/uv")"; \
+	UV_PROJECT_ENVIRONMENT="$(UV_PROJECT_ENVIRONMENT)" "$$UV_BIN" sync --project .
 	@cp -n .env.example .env || true
 	@echo "Installed in $(VENV_DIR)"
 
@@ -57,8 +69,10 @@ stop:
 	done
 
 upgrade: install
-	@UV_PROJECT_ENVIRONMENT="$(UV_PROJECT_ENVIRONMENT)" uv lock --project . --upgrade
-	@UV_PROJECT_ENVIRONMENT="$(UV_PROJECT_ENVIRONMENT)" uv sync --project .
+	@UV_BIN="$$(command -v uv || echo "$$HOME/.local/bin/uv")"; \
+	UV_PROJECT_ENVIRONMENT="$(UV_PROJECT_ENVIRONMENT)" "$$UV_BIN" lock --project . --upgrade
+	@UV_BIN="$$(command -v uv || echo "$$HOME/.local/bin/uv")"; \
+	UV_PROJECT_ENVIRONMENT="$(UV_PROJECT_ENVIRONMENT)" "$$UV_BIN" sync --project .
 	@echo "Dependencies upgraded."
 
 status:
