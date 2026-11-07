@@ -256,4 +256,4 @@ asyncio.run(main())
 
 ## License
 
-MIT (or your preferred license).
+MIT. See [LICENSE](LICENSE).
